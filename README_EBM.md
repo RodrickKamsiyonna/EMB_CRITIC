@@ -28,11 +28,12 @@ Action-free Energy-Based World Model built on top of `le-wm` (`stable-worldmodel
 ## Commands
 
 ```bash
-# 1. Install LeWM dependencies (on GPU/A100 runtime)
-pip install "stable-worldmodel[train,env]"
+# 1. Install LeWM + HDF5 + PushT dependencies (Python 3.10–3.13 compatible)
+pip install "stable-worldmodel[train]" h5py hdf5plugin pygame pymunk shapely "imageio[ffmpeg]"
 
-# 2. Run unit & integration verification tests (works on CPU too)
+# 2. Run unit & end-to-end training/resume tests
 python tests/test_ebm_wm.py
+python tests/test_train_ebm_e2e.py
 
 # 3. Train on PushT (default LeWM tiny width: 6L, d=192, frameskip=5, T=4)
 python train_ebm.py data=pusht

@@ -34,6 +34,12 @@ from utils import get_column_normalizer, get_img_preprocessor
 
 def ebm_forward(self, batch, stage, cfg):
     """Forward step for EBMWorldModel: denoising EBM + SIGReg + detached IDM + research logs."""
+    # stable_pretraining passes stage="fit" for train and stage="validate" for val
+    stage_name = (
+        "train" if stage in ("fit", "train")
+        else ("val" if stage in ("validate", "val") else stage)
+    )
+
     output = self.model.compute_losses(
         batch=batch,
         sigreg=self.sigreg,
@@ -46,13 +52,13 @@ def ebm_forward(self, batch, stage, cfg):
     log_payload = {}
     for k, v in output.items():
         if torch.is_tensor(v) and v.ndim == 0:
-            log_payload[f"{stage}/{k}"] = v.detach()
+            log_payload[f"{stage_name}/{k}"] = v.detach()
 
-    on_step = stage == "train"
+    on_step = stage_name == "train"
     self.log_dict(log_payload, on_step=on_step, on_epoch=True, sync_dist=True)
 
     # Stash a small validation sample for epoch-end research probes (erank, shuffle gap, inpainting)
-    if stage == "val" and hasattr(self, "_val_probe_cache"):
+    if stage_name == "val" and hasattr(self, "_val_probe_cache"):
         cache = self._val_probe_cache
         if cache["n_batches"] < cfg.logging.val_probe_max_batches:
             cache["embs"].append(output["emb"].detach().cpu())
@@ -79,19 +85,25 @@ class ResumableDatasetCallback(Callback):
     def on_train_epoch_start(self, trainer, pl_module):
         cur_epoch = int(trainer.current_epoch)
         self.train_sampler.set_epoch(cur_epoch)
+        full_batches = self.train_sampler.num_batches_per_rank()
 
-        if self.resumed_epoch is not None and cur_epoch == self.resumed_epoch:
+        if (
+            self.resumed_epoch is not None
+            and cur_epoch == self.resumed_epoch
+            and 0 < self.batches_seen_in_epoch < full_batches
+        ):
             # Arm exact mid-epoch batch offset; keep batches_seen_in_epoch accumulating from here
             self.train_sampler.set_resume(cur_epoch, self.batches_seen_in_epoch)
             if trainer.is_global_zero:
                 print(
                     f"[EBM-WM] Resuming dataset mid-epoch: epoch={cur_epoch}, "
-                    f"skipping {self.batches_seen_in_epoch} already-completed batches/rank."
+                    f"skipping {self.batches_seen_in_epoch}/{full_batches} already-completed batches/rank."
                 )
             self.resumed_epoch = None
         else:
             self.batches_seen_in_epoch = 0
             self.train_sampler.set_resume(None, 0)
+            self.resumed_epoch = None
         self.last_epoch = cur_epoch
 
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
@@ -105,11 +117,11 @@ class ResumableDatasetCallback(Callback):
         }
 
     def load_state_dict(self, state_dict):
+        # Defer arming the sampler until on_train_epoch_start so Lightning's
+        # pre-fit `estimated_stepping_batches` sees the true full epoch length.
         self.last_epoch = int(state_dict.get("epoch", 0))
         self.batches_seen_in_epoch = int(state_dict.get("batches_seen_in_epoch", 0))
         self.resumed_epoch = self.last_epoch
-        self.train_sampler.set_epoch(self.last_epoch)
-        self.train_sampler.set_resume(self.resumed_epoch, self.batches_seen_in_epoch)
 
 
 class LatestStepWeightsCallback(Callback):
@@ -344,12 +356,17 @@ def run(cfg):
 
     world_model = hydra.utils.instantiate(cfg.model)
 
+    trainer_kwargs = OmegaConf.to_container(cfg.trainer, resolve=True)
+    grad_clip_val = trainer_kwargs.pop("gradient_clip_val", None)
+    trainer_kwargs["use_distributed_sampler"] = False
+
     optimizers = {
         "model_opt": {
             "modules": "model",
             "optimizer": dict(cfg.optimizer),
             "scheduler": {"type": "LinearWarmupCosineAnnealingLR"},
             "interval": "epoch",
+            "gradient_clip_val": grad_clip_val,
         },
     }
 
@@ -406,25 +423,23 @@ def run(cfg):
     )
     research_cb = EBMResearchCallback(run_dir=run_dir, cfg=cfg)
 
-    trainer_kwargs = OmegaConf.to_container(cfg.trainer, resolve=True)
-    trainer_kwargs["use_distributed_sampler"] = False
+    pl.seed_everything(cfg.seed, workers=True)
 
     trainer = pl.Trainer(
         **trainer_kwargs,
+        default_root_dir=str(run_dir),
         callbacks=[resumable_cb, step_ckpt_cb, latest_weights_cb, research_cb],
         num_sanity_val_steps=0 if resume_ckpt else 1,
         logger=logger,
         enable_checkpointing=True,
     )
+    # Expose gradient_clip_val_ for spt.Module's manual-optimization gradient clipping
+    trainer.gradient_clip_val_ = grad_clip_val
+    trainer.gradient_clip_algorithm_ = "norm"
 
-    manager = spt.Manager(
-        trainer=trainer,
-        module=pl_module,
-        data=data_module,
-        ckpt_path=resume_ckpt,
-    )
-
-    manager()
+    # Call trainer.fit directly (bypassing spt.Manager, which overrides ModelCheckpoint dirpath
+    # into /root/.cache and defaults to weights_only=True on ckpt_path).
+    trainer.fit(pl_module, datamodule=data_module, ckpt_path=resume_ckpt)
     return
 
 

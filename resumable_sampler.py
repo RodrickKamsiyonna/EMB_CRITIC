@@ -71,6 +71,11 @@ class ResumableDistributedSampler(Sampler[int]):
             return num_global_batches * self.batch_size
         return math.ceil(self.dataset_len / world_size)
 
+    def num_batches_per_rank(self) -> int:
+        _, world_size = self._get_dist_info()
+        n = self._num_samples_per_rank(world_size)
+        return n // self.batch_size if self.drop_last else math.ceil(n / self.batch_size)
+
     def _build_rank_indices(self, epoch: int, rank: int, world_size: int):
         num_per_rank = self._num_samples_per_rank(world_size)
         total_size = num_per_rank * world_size
