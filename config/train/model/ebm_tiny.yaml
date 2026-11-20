@@ -1,0 +1,43 @@
+_target_: ebm_modules.EBMWorldModel
+
+# Denoising EBM hyperparameters
+alpha: 1.0
+logit_normal_mean: -1.5
+logit_normal_std: 0.8
+noise_scale: 2.0
+detach_x: true             # Noisy input x is detached from encoder before E(x) and MSE
+detach_target: false       # Target clean standardized embeddings are NOT detached
+detach_idm_input: true     # IDM trains on detached clean standardized embeddings
+std_eps: 1e-6
+
+# ResNet-18 from scratch -> MLP projector -> embed_dim (LeWM tiny width)
+encoder:
+  _target_: ebm_modules.ResNet18Encoder
+  embed_dim: ${embed_dim}
+  projector_hidden_dim: 2048
+  pretrained: false
+  projector_norm: batch
+
+# Causal RoPE Transformer EBM scaled to LeWM tiny width (6L, d=192, 3 heads x 64)
+ebm:
+  _target_: ebm_modules.EBMTransformer
+  embed_dim: ${embed_dim}
+  n_layer: 6
+  n_head: 3
+  head_dim: 64
+  mlp_dim: 768
+  energy_mlp_dim: 768
+  max_seq_len: 1024
+  qk_norm: true
+  activation: relu2
+  dropout: 0.0
+  rope_base: 10000.0
+  energy_eps: 1e-8
+
+# Inverse Dynamics Model predicting frameskip * action_dim from (e_t, e_{t+1})
+idm:
+  _target_: ebm_modules.InverseDynamicsModel
+  embed_dim: ${embed_dim}
+  action_dim: ???          # populated automatically in train_ebm.py
+  hidden_dim: 512
+  dropout: 0.0

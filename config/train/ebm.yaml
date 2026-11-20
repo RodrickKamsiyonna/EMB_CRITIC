@@ -1,0 +1,64 @@
+defaults:
+  - _self_
+  - launcher: local
+  - data: pusht
+  - model: ebm_tiny
+
+output_model_name: ebm_wm
+subdir: ${hydra:job.id}
+
+num_workers: 6
+train_split: 0.9
+seed: 3072
+img_size: 224
+embed_dim: 192
+history_size: 3
+num_preds: 1
+
+trainer:
+  max_epochs: 100
+  devices: auto
+  accelerator: gpu
+  precision: bf16
+  gradient_clip_val: 1.0
+
+loader:
+  batch_size: 128
+  num_workers: ${num_workers}
+  persistent_workers: True
+  prefetch_factor: 3
+  pin_memory: True
+
+optimizer:
+  type: AdamW
+  lr: 5e-5
+  weight_decay: 1e-3
+
+loss:
+  sigreg:
+    weight: 0.09
+    target: raw   # "raw" (pre-standardization clean embeddings) | "std"
+    kwargs:
+      knots: 17
+      num_proj: 1024
+  idm:
+    weight: 1.0
+
+logging:
+  compute_diagnostics: true
+  save_every_n_epochs: 1
+  val_probe_max_batches: 4
+  val_probe_samples: 64
+  val_inpaint_every_n_epochs: 5
+  val_inpaint_samples: 16
+  val_inpaint_steps: 40
+  val_inpaint_lr: 0.05
+  val_inpaint_restarts: 8
+  val_inpaint_noise_std: 1.0
+
+wandb:
+  enabled: false
+  config:
+    entity: null
+    project: ebm_critic
+    name: ${output_model_name}

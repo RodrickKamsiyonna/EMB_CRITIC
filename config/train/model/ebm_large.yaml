@@ -1,0 +1,43 @@
+# Full-scale causal RoPE Transformer EBM preset:
+# 15 layers, embedding width 1664, 13 attention heads x dim 128, max_seq_len 1024.
+# Run with: python train_ebm.py model=ebm_large embed_dim=1664 loader.batch_size=16
+
+_target_: ebm_modules.EBMWorldModel
+
+alpha: 1.0
+logit_normal_mean: -1.5
+logit_normal_std: 0.8
+noise_scale: 2.0
+detach_x: true
+detach_target: false
+detach_idm_input: true
+std_eps: 1e-6
+
+encoder:
+  _target_: ebm_modules.ResNet18Encoder
+  embed_dim: 1664
+  projector_hidden_dim: 2048
+  pretrained: false
+  projector_norm: batch
+
+ebm:
+  _target_: ebm_modules.EBMTransformer
+  embed_dim: 1664
+  n_layer: 15
+  n_head: 13
+  head_dim: 128
+  mlp_dim: 6656
+  energy_mlp_dim: 6656
+  max_seq_len: 1024
+  qk_norm: true
+  activation: relu2
+  dropout: 0.0
+  rope_base: 10000.0
+  energy_eps: 1e-8
+
+idm:
+  _target_: ebm_modules.InverseDynamicsModel
+  embed_dim: 1664
+  action_dim: ???
+  hidden_dim: 1024
+  dropout: 0.0
