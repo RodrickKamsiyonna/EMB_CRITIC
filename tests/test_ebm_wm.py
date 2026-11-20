@@ -126,24 +126,33 @@ def test_gradient_isolation_and_double_backward():
     # Inject a NaN action on last step to verify boundary NaN masking
     batch["action"][0, -1] = float("nan")
 
-    # 1. Verify x is detached before E(x) and e_hat (e_hat does NOT backprop into encoder)
-    #    while denoise_loss STILL flows into BOTH encoder (via non-detached target) and ebm (via e_hat), NOT idm
+    # 1. Verify exact gradient semantics for e_hat = x.detach() - (1/alpha) * grad_x E(x):
+    #    - x enters E(x) NON-DETACHED, so grad_x E(x) DOES backprop into encoder via x
+    #    - skip term x in e_hat IS detached, so d(e_hat)/d(encoder) == d(-(1/alpha)*grad_x)/d(encoder) EXACTLY
+    #    - denoise_loss flows into BOTH encoder and ebm, NOT idm
     model.train()
     model.zero_grad()
-    out = model.compute_losses(batch, sigreg=sigreg, sigreg_weight=0.0, idm_weight=0.0)
-    enc_grads_from_ehat = torch.autograd.grad(
-        out["e_hat"].sum(),
-        list(model.encoder.parameters()),
-        retain_graph=True,
-        allow_unused=True,
-    )
-    assert all(g is None for g in enc_grads_from_ehat), "x was NOT detached: e_hat backpropped into encoder!"
+    _, clean_e = model.encode_pixels(batch["pixels"])
+    corrupt = model.sample_corruption(clean_e)
+    d_out = model.denoise(corrupt["x"], valid_mask=corrupt["valid_mask"], create_graph=True)
 
+    enc_params = [p for p in model.encoder.parameters() if p.requires_grad]
+    probe = torch.randn_like(d_out["e_hat"])
+    g_from_ehat = torch.autograd.grad((d_out["e_hat"] * probe).sum(), enc_params, retain_graph=True)
+    g_from_neg_gradx = torch.autograd.grad(
+        ((-(1.0 / model.alpha) * d_out["grad_x"]) * probe).sum(), enc_params, retain_graph=True
+    )
+    assert any(g.abs().max().item() > 0 for g in g_from_ehat), "x did not receive gradient through grad_x E(x)!"
+    for g1, g2 in zip(g_from_ehat, g_from_neg_gradx):
+        assert torch.allclose(g1, g2, atol=1e-5, rtol=1e-4), "Skip term x was NOT detached in e_hat!"
+
+    model.zero_grad()
+    out = model.compute_losses(batch, sigreg=sigreg, sigreg_weight=0.0, idm_weight=0.0)
     out["denoise_loss"].backward()
     enc_gn = sum(p.grad.norm().item() for p in model.encoder.parameters() if p.grad is not None)
     ebm_gn = sum(p.grad.norm().item() for p in model.ebm.parameters() if p.grad is not None)
     idm_gn = sum(p.grad.norm().item() for p in model.idm.parameters() if p.grad is not None)
-    assert enc_gn > 0, "Denoise loss produced zero grad on encoder (target should NOT be detached)!"
+    assert enc_gn > 0, "Denoise loss produced zero grad on encoder!"
     assert ebm_gn > 0, "Denoise loss produced zero grad on EBM!"
     assert idm_gn == 0, "Denoise loss leaked grad into IDM!"
 

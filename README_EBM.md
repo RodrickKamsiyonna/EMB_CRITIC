@@ -15,7 +15,7 @@ Action-free Energy-Based World Model built on top of `le-wm` (`stable-worldmodel
      - Default (`model=ebm_tiny`): 6 layers, `embed_dim=192`, 3 heads × `head_dim=64` (~15M total params, matching LeWM's tiny scale for fast single-A100 training).
      - Large preset (`model=ebm_large`): 15 layers, `embed_dim=1664`, 13 heads × `head_dim=128`, `max_seq_len=1024`.
    - **Energy Head:** 2-layer MLP mapping each final hidden state to a $D$-dim vector; its L2 norm gives positive scalar token energy, summed over valid tokens to produce sequence energy $E(x)$.
-   - **Denoising MSE:** $\hat{e} = x_{\text{det}} - \frac{1}{\alpha}\nabla_{x_{\text{det}}} E(x_{\text{det}})$ ($\alpha=1$, with noisy input $x$ **detached** from the encoder), plain MSE against **non-detached** clean standardized embeddings averaged only over selected tokens and embedding dimensions (no $\gamma$ weighting).
+   - **Denoising MSE:** $\hat{e} = \operatorname{sg}(x) - \frac{1}{\alpha}\nabla_x E(x)$ ($\alpha=1$): $x$ enters $E(x)$ **non-detached** (so $x$ still receives gradients through $\nabla_x E(x)$), while the additive skip term $x$ in $\hat{e}$ is detached so the MSE pushes gradients through $\nabla_x E(x)$ only; the target clean standardized embeddings are **non-detached**, averaged only over selected tokens and embedding dimensions (no $\gamma$ weighting).
 3. **Regularization & Inverse Dynamics Model**
    - **SIGReg** (from LeWM) applied to clean embeddings (`weight=0.09`).
    - **IDM (`InverseDynamicsModel`):** trained on **detached** consecutive clean standardized embeddings $(e_t, e_{t+1})$ to predict the `frameskip * action_dim` action chunk between frames.

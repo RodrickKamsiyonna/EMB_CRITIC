@@ -453,7 +453,7 @@ class EBMWorldModel(nn.Module):
         logit_normal_mean: float = -1.5,
         logit_normal_std: float = 0.8,
         noise_scale: float = 2.0,
-        detach_x: bool = True,
+        detach_x_skip: bool = True,
         detach_target: bool = False,
         detach_idm_input: bool = True,
         std_eps: float = 1e-6,
@@ -466,7 +466,7 @@ class EBMWorldModel(nn.Module):
         self.logit_normal_mean = float(logit_normal_mean)
         self.logit_normal_std = float(logit_normal_std)
         self.noise_scale = float(noise_scale)
-        self.detach_x = bool(detach_x)
+        self.detach_x_skip = bool(detach_x_skip)
         self.detach_target = bool(detach_target)
         self.detach_idm_input = bool(detach_idm_input)
         self.std_eps = float(std_eps)
@@ -551,25 +551,26 @@ class EBMWorldModel(nn.Module):
         x: torch.Tensor,
         valid_mask: Optional[torch.Tensor] = None,
         create_graph: Optional[bool] = None,
-        detach_x: Optional[bool] = None,
+        detach_x_skip: Optional[bool] = None,
     ) -> Dict[str, torch.Tensor]:
-        """Compute energy and one-step gradient denoising e_hat = x - (1/alpha) * grad_x E(x).
+        """Compute energy and one-step gradient denoising e_hat = sg(x) - (1/alpha) * grad_x E(x).
 
-        When detach_x=True (default), x is detached from the encoder graph before computing
-        E(x) and grad_x E(x), so e_hat only backpropagates into the EBM parameters while the
-        non-detached target clean_emb provides MSE gradients to the encoder.
+        x enters E(x) WITHOUT being detached (so x still receives gradients through grad_x E(x)
+        when create_graph=True). When detach_x_skip=True (default), only the additive skip term
+        x in e_hat = x.detach() - (1/alpha) * grad_x is detached so the MSE passes gradients
+        through grad_x E(x) rather than a direct skip path on x.
         """
         if create_graph is None:
             create_graph = self.training and torch.is_grad_enabled()
-        if detach_x is None:
-            detach_x = self.detach_x
+        if detach_x_skip is None:
+            detach_x_skip = self.detach_x_skip
 
         # Always enable grad locally so validation (under torch.no_grad) can still take grad_x E(x)
         with torch.enable_grad():
-            if detach_x or not create_graph:
-                x_in = x.detach().requires_grad_(True)
-            else:
+            if create_graph:
                 x_in = x if x.requires_grad else x.requires_grad_(True)
+            else:
+                x_in = x.detach().requires_grad_(True)
 
             seq_energy, token_energy = self.compute_energy(x_in, valid_mask=valid_mask)
             grad_x = torch.autograd.grad(
@@ -578,7 +579,8 @@ class EBMWorldModel(nn.Module):
                 create_graph=create_graph,
                 retain_graph=create_graph,
             )[0]
-            e_hat = x_in - (1.0 / self.alpha) * grad_x
+            x_skip = x_in.detach() if detach_x_skip else x_in
+            e_hat = x_skip - (1.0 / self.alpha) * grad_x
 
         if not create_graph:
             e_hat = e_hat.detach()
