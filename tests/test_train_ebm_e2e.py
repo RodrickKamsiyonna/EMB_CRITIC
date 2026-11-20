@@ -48,6 +48,8 @@ def main():
     env["LOCAL_DATASET_DIR"] = str(data_root)
     env["STABLEWM_HOME"] = str(run_home)
     env["HYDRA_FULL_ERROR"] = "1"
+    env["WANDB_MODE"] = "offline"
+    env["WANDB_DIR"] = str(tmp_root)
 
     base_cmd = [
         sys.executable,
@@ -82,7 +84,9 @@ def main():
         "loader.persistent_workers=false",
         "loader.prefetch_factor=null",
         "loader.pin_memory=false",
-        "wandb.enabled=false",
+        "wandb.enabled=true",
+        "wandb.config.project=emb_critic",
+        "wandb.config.name=e2e_test_wandb",
     ]
 
     print("=== Phase 1: Mid-epoch stop (max_steps=4, save_every_n_steps=2) ===")

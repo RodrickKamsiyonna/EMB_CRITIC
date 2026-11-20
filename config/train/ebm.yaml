@@ -1,8 +1,8 @@
 defaults:
-  - _self_
   - launcher: local
   - data: pusht
   - model: ebm_tiny
+  - _self_
 
 output_model_name: ebm_wm
 subdir: ${output_model_name}   # deterministic run dir for automatic resume

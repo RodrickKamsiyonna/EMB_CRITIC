@@ -396,7 +396,11 @@ def run(cfg):
 
     logger = None
     if cfg.wandb.enabled:
-        wandb_cfg = OmegaConf.to_container(cfg.wandb.config, resolve=True)
+        wandb_cfg = dict(OmegaConf.to_container(cfg.wandb.config, resolve=True) or {})
+        wandb_cfg.pop("id", None)
+        wandb_cfg.pop("resume", None)
+        if wandb_cfg.get("entity") in (None, "", "null", "lewm"):
+            wandb_cfg["entity"] = None
         wandb_id = _get_or_create_wandb_id(run_dir, auto_resume=auto_resume)
         logger = WandbLogger(id=wandb_id, resume="allow", **wandb_cfg)
         logger.log_hyperparams(OmegaConf.to_container(cfg, resolve=True))
