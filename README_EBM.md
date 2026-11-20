@@ -45,6 +45,11 @@ python eval_ebm.py --config-name=pusht_ebm_openloop.yaml policy=ebm_wm
 python eval_ebm.py --config-name=pusht_ebm_closedloop.yaml policy=ebm_wm
 ```
 
+## Checkpointing & Exact Auto-Resume
+
+- **Per-step checkpointing (latest only):** Every `logging.save_every_n_steps` (default `1000` steps), overwrites `last.ckpt` (full Lightning state: model, optimizer, scheduler, epoch, step, and dataset batch cursor) and `weights_latest.pt` (inference weights for `eval_ebm.py`). Old checkpoints are not accumulated.
+- **Automatic resume (`training.auto_resume=true`):** Re-running `train_ebm.py` with the same `output_model_name` automatically detects `last.ckpt`, restores model/optimizer/scheduler state, resumes the same WandB run ID (`wandb_run_id.txt`), and uses `ResumableDistributedSampler` ([resumable_sampler.py](resumable_sampler.py)) to skip already-processed batches and continue from the **exact mid-epoch dataset position** (single-GPU and DDP).
+
 ## Research Logs (WandB + `metrics.jsonl`)
 
 Every run logs to WandB (when `wandb.enabled=true`) and persists epoch summaries to `metrics.jsonl`:

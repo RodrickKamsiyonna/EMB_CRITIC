@@ -5,7 +5,10 @@ defaults:
   - model: ebm_tiny
 
 output_model_name: ebm_wm
-subdir: ${hydra:job.id}
+subdir: ${output_model_name}   # deterministic run dir for automatic resume
+
+training:
+  auto_resume: true            # automatically resume from run_dir/last.ckpt if present
 
 num_workers: 6
 train_split: 0.9
@@ -46,7 +49,7 @@ loss:
 
 logging:
   compute_diagnostics: true
-  save_every_n_epochs: 1
+  save_every_n_steps: 1000     # save latest checkpoint every 1000 steps (overwrite in place)
   val_probe_max_batches: 4
   val_probe_samples: 64
   val_inpaint_every_n_epochs: 5

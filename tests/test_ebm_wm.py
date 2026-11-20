@@ -18,6 +18,7 @@ from ebm_modules import (
 )
 from module import SIGReg
 from planner import EBMLatentPlanner, EBMPlanSolver, run_ebm_rollout
+from resumable_sampler import ResumableDistributedSampler
 
 
 def build_tiny_model(embed_dim=192, action_dim=10):
@@ -325,6 +326,51 @@ def test_mini_training_step_decreases_loss():
     print(f"[PASS] test_mini_training_step_decreases_loss (start={losses[0]:.3f} -> end={losses[-1]:.3f})")
 
 
+def test_resumable_sampler_single_and_ddp():
+    from torch.utils.data import DataLoader, TensorDataset
+
+    ds = TensorDataset(torch.arange(205))  # non-divisible size to verify drop_last handling
+
+    # 1. Single GPU exact mid-epoch resume
+    s_full = ResumableDistributedSampler(len(ds), batch_size=16, seed=3072, rank=0, world_size=1)
+    s_full.set_epoch(0)
+    full_batches = [b[0].tolist() for b in DataLoader(ds, batch_size=16, sampler=s_full, drop_last=True)]
+    assert len(full_batches) == 205 // 16
+
+    # Simulate stop after 5 batches, then resume with fresh sampler instance
+    part1 = full_batches[:5]
+    s_res = ResumableDistributedSampler(len(ds), batch_size=16, seed=3072, rank=0, world_size=1)
+    s_res.set_epoch(0)
+    s_res.set_resume(epoch=0, start_batch=5)
+    assert len(s_res) == (len(full_batches) - 5) * 16
+    part2 = [b[0].tolist() for b in DataLoader(ds, batch_size=16, sampler=s_res, drop_last=True)]
+    assert part1 + part2 == full_batches, "Single-GPU mid-epoch resume mismatch!"
+
+    # Verify next epoch (epoch=1) automatically starts at batch 0 with full length
+    s_res.set_epoch(1)
+    s_full.set_epoch(1)
+    ep1_res = [b[0].tolist() for b in DataLoader(ds, batch_size=16, sampler=s_res, drop_last=True)]
+    ep1_full = [b[0].tolist() for b in DataLoader(ds, batch_size=16, sampler=s_full, drop_last=True)]
+    assert ep1_res == ep1_full and ep1_res != full_batches
+
+    # 2. Multi-GPU DDP (world_size=2) exact mid-epoch resume + disjoint ranks
+    seen_across_ranks = []
+    for r in (0, 1):
+        sf = ResumableDistributedSampler(len(ds), batch_size=16, seed=3072, rank=r, world_size=2)
+        sf.set_epoch(2)
+        fb = [b[0].tolist() for b in DataLoader(ds, batch_size=16, sampler=sf, drop_last=True)]
+        seen_across_ranks.append([idx for batch in fb for idx in batch])
+
+        sr = ResumableDistributedSampler(len(ds), batch_size=16, seed=3072, rank=r, world_size=2)
+        sr.set_epoch(2)
+        sr.set_resume(epoch=2, start_batch=3)
+        rb = [b[0].tolist() for b in DataLoader(ds, batch_size=16, sampler=sr, drop_last=True)]
+        assert fb[:3] + rb == fb, f"DDP rank {r} mid-epoch resume mismatch!"
+
+    assert set(seen_across_ranks[0]).isdisjoint(set(seen_across_ranks[1])), "DDP ranks overlapped!"
+    print("[PASS] test_resumable_sampler_single_and_ddp")
+
+
 if __name__ == "__main__":
     test_standardization()
     test_corruption_schedule()
@@ -333,4 +379,5 @@ if __name__ == "__main__":
     test_open_loop_and_closed_loop_planning()
     test_tiny_and_large_ebm_shapes()
     test_mini_training_step_decreases_loss()
+    test_resumable_sampler_single_and_ddp()
     print("\nALL EBM-WM TESTS PASSED!")
