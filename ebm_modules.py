@@ -479,10 +479,33 @@ class EBMWorldModel(nn.Module):
         self.detach_idm_input = bool(detach_idm_input)
         self.std_eps = float(std_eps)
 
-    def encode_pixels(self, pixels: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Encode pixels -> (raw_emb, standardized_emb), both shape (B, T, D)."""
-        raw_emb = self.encoder(pixels)
-        std_emb = standardize_tokens(raw_emb, eps=self.std_eps)
+    def encode_pixels(
+        self,
+        pixels: torch.Tensor,
+        valid_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Encode pixels -> (raw_emb, standardized_emb), both shape (B, T, D).
+
+        When `valid_mask` (B, T) is provided for padded variable-length episodes,
+        only valid frames are passed through ResNet-18 so BatchNorm and compute are
+        not affected by zero-padded frames.
+        """
+        if valid_mask is None or valid_mask.all():
+            raw_emb = self.encoder(pixels)
+            std_emb = standardize_tokens(raw_emb, eps=self.std_eps)
+            return raw_emb, std_emb
+
+        vm = valid_mask.to(dtype=torch.bool, device=pixels.device)
+        b, t = vm.shape
+        valid_pixels = pixels[vm]  # (N_valid, C, H, W)
+        valid_raw = self.encoder(valid_pixels)  # (N_valid, D)
+        valid_std = standardize_tokens(valid_raw, eps=self.std_eps)
+
+        d = valid_raw.shape[-1]
+        raw_emb = torch.zeros((b, t, d), device=valid_raw.device, dtype=valid_raw.dtype)
+        std_emb = torch.zeros((b, t, d), device=valid_std.device, dtype=valid_std.dtype)
+        raw_emb[vm] = valid_raw
+        std_emb[vm] = valid_std
         return raw_emb, std_emb
 
     def encode(self, info: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
@@ -617,30 +640,38 @@ class EBMWorldModel(nn.Module):
         compute_diagnostics: bool = True,
     ) -> Dict[str, torch.Tensor]:
         """Compute full training/validation losses and research diagnostics."""
-        raw_emb, clean_emb = self.encode_pixels(batch["pixels"])  # (B, T, D)
-        b, t, d = clean_emb.shape
         valid_mask = batch.get("valid_mask", None)
+        if valid_mask is not None:
+            valid_mask = valid_mask.to(dtype=torch.bool, device=batch["pixels"].device)
 
-        # --- 1. Corruption & Denoising EBM loss (NON-DETACHED target by default) ---
+        raw_emb, clean_emb = self.encode_pixels(batch["pixels"], valid_mask=valid_mask)  # (B, T, D)
+        b, t, d = clean_emb.shape
+
+        # --- 1. Corruption & Denoising EBM MSE loss (skip x detached, target NOT detached) ---
         corrupt = self.sample_corruption(clean_emb, valid_mask=valid_mask)
         x = corrupt["x"]
         selected = corrupt["selected"]  # (B, T)
-        gamma = corrupt["gamma"]  # (B,)
+        vm = corrupt["valid_mask"]      # (B, T)
+        gamma = corrupt["gamma"]        # (B,)
 
         is_train_graph = self.training and torch.is_grad_enabled()
-        denoise_out = self.denoise(x, valid_mask=corrupt["valid_mask"], create_graph=is_train_graph)
+        denoise_out = self.denoise(x, valid_mask=vm, create_graph=is_train_graph)
         e_hat = denoise_out["e_hat"]
         grad_x = denoise_out["grad_x"]
 
         target = clean_emb.detach() if self.detach_target else clean_emb
         sq_err = (e_hat - target).pow(2)  # (B, T, D)
         # Average only over selected tokens and embedding dimensions, no gamma weighting
-        denoise_loss = sq_err[selected].mean()
+        mse_loss = sq_err[selected].mean()
 
-        # --- 2. SIGReg regularizer on clean embeddings ---
+        # --- 2. SIGReg regularizer on valid clean embeddings ---
         if sigreg is not None and sigreg_weight > 0.0:
-            sigreg_in = raw_emb if sigreg_target == "raw" else clean_emb
-            sigreg_loss = sigreg(sigreg_in.transpose(0, 1))
+            sigreg_src = raw_emb if sigreg_target == "raw" else clean_emb
+            if valid_mask is not None and not vm.all():
+                # Flatten only real (unpadded) tokens -> (1, N_valid, D)
+                sigreg_loss = sigreg(sigreg_src[vm].unsqueeze(0))
+            else:
+                sigreg_loss = sigreg(sigreg_src.transpose(0, 1))
         else:
             sigreg_loss = clean_emb.new_tensor(0.0)
 
@@ -651,27 +682,26 @@ class EBMWorldModel(nn.Module):
         raw_actions = batch["action"][:, :-1].float()  # (B, T-1, A) transitions t -> t+1
         valid_act = ~torch.isnan(raw_actions).any(dim=-1)  # (B, T-1)
         if valid_mask is not None:
-            vm = valid_mask.to(torch.bool)
             valid_act = valid_act & vm[:, :-1] & vm[:, 1:]
 
         if valid_act.any():
             clean_actions = torch.nan_to_num(raw_actions, nan=0.0)
-            idm_loss = F.mse_loss(pred_actions[valid_act], clean_actions[valid_act])
+            idm_mse_loss = F.mse_loss(pred_actions[valid_act], clean_actions[valid_act])
             with torch.no_grad():
                 idm_cos = F.cosine_similarity(
                     pred_actions[valid_act].detach(), clean_actions[valid_act], dim=-1
                 ).mean()
         else:
-            idm_loss = clean_emb.new_tensor(0.0)
+            idm_mse_loss = clean_emb.new_tensor(0.0)
             idm_cos = clean_emb.new_tensor(0.0)
 
-        total_loss = denoise_loss + sigreg_weight * sigreg_loss + idm_weight * idm_loss
+        total_loss = mse_loss + sigreg_weight * sigreg_loss + idm_weight * idm_mse_loss
 
         out: Dict[str, torch.Tensor] = {
             "loss": total_loss,
-            "denoise_loss": denoise_loss,
+            "mse_loss": mse_loss,
             "sigreg_loss": sigreg_loss,
-            "idm_loss": idm_loss,
+            "idm_mse_loss": idm_mse_loss,
             "raw_emb": raw_emb,
             "emb": clean_emb,
             "e_hat": e_hat,
@@ -682,12 +712,13 @@ class EBMWorldModel(nn.Module):
         if compute_diagnostics:
             with torch.no_grad():
                 out["diag/idm_cos_sim"] = idm_cos
+                out["diag/avg_ep_frames"] = vm.float().sum(dim=1).mean()
 
                 # Baseline identity MSE: how noisy x is before denoising
                 id_sq_err = (x.detach() - clean_emb.detach()).pow(2)
                 baseline_mse = id_sq_err[selected].mean()
                 out["diag/baseline_identity_mse"] = baseline_mse
-                out["diag/denoise_ratio"] = denoise_loss.detach() / (baseline_mse + 1e-8)
+                out["diag/denoise_ratio"] = mse_loss.detach() / (baseline_mse + 1e-8)
 
                 # Gamma-stratified denoising MSE
                 tok_mse = sq_err.detach().mean(dim=-1)  # (B, T)
@@ -701,15 +732,15 @@ class EBMWorldModel(nn.Module):
                     if m.any():
                         out[f"diag/denoise_mse_{name}"] = tok_mse[m].mean()
 
-                # Corruption schedule stats
+                # Corruption schedule stats (over valid tokens only)
                 out["diag/mask_ratio_mean"] = corrupt["mask_ratio"].mean()
-                out["diag/selected_frac"] = selected.float().mean()
+                out["diag/selected_frac"] = selected[vm].float().mean()
                 out["diag/gamma_mean"] = gamma.mean()
                 out["diag/gamma_median"] = gamma.median()
 
                 # Energy landscape: noisy vs clean (and grad norms)
                 noisy_e = denoise_out["seq_energy"].detach()
-                clean_e, _ = self.compute_energy(clean_emb.detach(), valid_mask=corrupt["valid_mask"])
+                clean_e, _ = self.compute_energy(clean_emb.detach(), valid_mask=vm)
                 out["diag/energy_noisy_mean"] = noisy_e.mean()
                 out["diag/energy_noisy_std"] = noisy_e.std(unbiased=False)
                 out["diag/energy_clean_mean"] = clean_e.mean()
@@ -720,19 +751,24 @@ class EBMWorldModel(nn.Module):
                 out["diag/energy_grad_norm_mean"] = grad_norms[selected].mean()
                 out["diag/energy_grad_norm_max"] = grad_norms[selected].max()
 
-                # Representation geometry & collapse monitors
-                raw_flat = raw_emb.detach().float().reshape(-1, d)
-                std_flat = clean_emb.detach().float().reshape(-1, d)
+                # Representation geometry & collapse monitors (valid tokens only)
+                raw_flat = raw_emb.detach()[vm].float()
+                std_flat = clean_emb.detach()[vm].float()
                 out["diag/raw_emb_norm_mean"] = raw_flat.norm(dim=-1).mean()
                 out["diag/raw_emb_batch_std"] = raw_flat.std(dim=0, unbiased=False).mean()
                 out["diag/std_emb_batch_std"] = std_flat.std(dim=0, unbiased=False).mean()
 
                 if t > 1:
-                    temp_diff = (clean_emb.detach()[:, 1:] - clean_emb.detach()[:, :-1]).float()
-                    out["diag/temporal_diff_norm"] = temp_diff.norm(dim=-1).mean()
+                    valid_pair = vm[:, :-1] & vm[:, 1:]
+                    if valid_pair.any():
+                        temp_diff = (clean_emb.detach()[:, 1:] - clean_emb.detach()[:, :-1])[valid_pair].float()
+                        out["diag/temporal_diff_norm"] = temp_diff.norm(dim=-1).mean()
 
                 if sigreg is not None and sigreg_target == "raw":
-                    out["diag/sigreg_on_std"] = sigreg(clean_emb.detach().transpose(0, 1))
+                    if valid_mask is not None and not vm.all():
+                        out["diag/sigreg_on_std"] = sigreg(clean_emb.detach()[vm].unsqueeze(0))
+                    else:
+                        out["diag/sigreg_on_std"] = sigreg(clean_emb.detach().transpose(0, 1))
 
         return out
 

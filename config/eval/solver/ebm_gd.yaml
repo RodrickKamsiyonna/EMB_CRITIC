@@ -10,6 +10,7 @@ cosine_lr: true
 langevin_noise_scale: 0.05
 project_std_after_step: false
 final_denoise_steps: 0
-history_size: 3
+history_size: 64
+shrink_horizon: true
 device: cuda
 seed: ${seed}

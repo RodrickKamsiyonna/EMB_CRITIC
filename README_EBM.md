@@ -35,11 +35,11 @@ pip install "stable-worldmodel[train]" h5py hdf5plugin pygame pymunk shapely "im
 python tests/test_ebm_wm.py
 python tests/test_train_ebm_e2e.py
 
-# 3. Train on PushT (default LeWM tiny width: 6L, d=192, frameskip=5, T=4)
-python train_ebm.py data=pusht
+# 3. Train on PushT (full-episode mode, frameskip=5, max_ep_frames=64)
+python train_ebm.py data=pusht data_mode=episode
 
 # 3b. Train with full 15L x 1664d preset
-python train_ebm.py data=pusht model=ebm_large embed_dim=1664 loader.batch_size=16
+python train_ebm.py data=pusht model=ebm_large embed_dim=1664 loader.batch_size=2
 
 # 4. Evaluate Open-Loop & Closed-Loop on PushT
 python eval_ebm.py --config-name=pusht_ebm_openloop.yaml policy=ebm_wm
@@ -54,7 +54,7 @@ python eval_ebm.py --config-name=pusht_ebm_closedloop.yaml policy=ebm_wm
 ## Research Logs (WandB + `metrics.jsonl`)
 
 Every run logs to WandB (when `wandb.enabled=true`) and persists epoch summaries to `metrics.jsonl`:
-- **Losses:** `loss`, `denoise_loss`, `sigreg_loss`, `idm_loss`, `diag/idm_cos_sim`
+- **Losses:** `train/mse_loss`, `val/mse_loss` (main denoising MSE), `train/idm_mse_loss`, `val/idm_mse_loss` (IDM action MSE), `sigreg_loss`, `loss`, `diag/idm_cos_sim`, `diag/avg_ep_frames`
 - **Denoising quality:** `diag/baseline_identity_mse`, `diag/denoise_ratio`, gamma-stratified MSE (`low_gamma`, `mid_gamma`, `high_gamma`)
 - **Energy landscape:** `diag/energy_clean_mean`, `diag/energy_noisy_mean`, `diag/energy_gap_noisy_minus_clean`, `diag/energy_grad_norm_mean`, `val_probe/energy_gap_rev_minus_real`, `val_probe/energy_gap_shuf_minus_real`
 - **Collapse & geometry:** `val_probe/effective_rank`, `diag/raw_emb_batch_std`, `diag/std_emb_batch_std`, `diag/temporal_diff_norm`

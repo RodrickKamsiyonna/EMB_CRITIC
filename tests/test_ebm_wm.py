@@ -152,24 +152,41 @@ def test_gradient_isolation_and_double_backward():
 
     model.zero_grad()
     out = model.compute_losses(batch, sigreg=sigreg, sigreg_weight=0.0, idm_weight=0.0)
-    out["denoise_loss"].backward()
+    out["mse_loss"].backward()
     enc_gn = sum(p.grad.norm().item() for p in model.encoder.parameters() if p.grad is not None)
     ebm_gn = sum(p.grad.norm().item() for p in model.ebm.parameters() if p.grad is not None)
     idm_gn = sum(p.grad.norm().item() for p in model.idm.parameters() if p.grad is not None)
-    assert enc_gn > 0, "Denoise loss produced zero grad on encoder!"
-    assert ebm_gn > 0, "Denoise loss produced zero grad on EBM!"
-    assert idm_gn == 0, "Denoise loss leaked grad into IDM!"
+    assert enc_gn > 0, "MSE loss produced zero grad on encoder!"
+    assert ebm_gn > 0, "MSE loss produced zero grad on EBM!"
+    assert idm_gn == 0, "MSE loss leaked grad into IDM!"
 
-    # 2. Verify idm_loss (detached embeddings) flows ONLY into IDM, NOT encoder or ebm
+    # 2. Verify idm_mse_loss (detached embeddings) flows ONLY into IDM, NOT encoder or ebm
     model.zero_grad()
     out = model.compute_losses(batch, sigreg=sigreg, sigreg_weight=0.0, idm_weight=1.0)
-    out["idm_loss"].backward()
+    out["idm_mse_loss"].backward()
     enc_gn = sum(p.grad.norm().item() for p in model.encoder.parameters() if p.grad is not None)
     ebm_gn = sum(p.grad.norm().item() for p in model.ebm.parameters() if p.grad is not None)
     idm_gn = sum(p.grad.norm().item() for p in model.idm.parameters() if p.grad is not None)
     assert enc_gn == 0, "IDM loss leaked grad into encoder despite detach_idm_input=True!"
     assert ebm_gn == 0, "IDM loss leaked grad into EBM!"
     assert idm_gn > 0, "IDM loss produced zero grad on IDM!"
+
+    # 2b. Verify padded variable-length episodes (valid_mask) run cleanly with zero NaNs
+    model.zero_grad()
+    padded_batch = {
+        "pixels": torch.randn(3, 8, 3, 64, 64),
+        "action": torch.randn(3, 8, 10),
+        "valid_mask": torch.tensor([
+            [1, 1, 1, 1, 1, 1, 1, 1],
+            [1, 1, 1, 1, 1, 0, 0, 0],
+            [1, 1, 1, 0, 0, 0, 0, 0],
+        ], dtype=torch.bool),
+    }
+    padded_batch["action"][~padded_batch["valid_mask"]] = float("nan")
+    p_out = model.compute_losses(padded_batch, sigreg=sigreg, sigreg_weight=0.09, idm_weight=1.0)
+    p_out["loss"].backward()
+    assert torch.isfinite(p_out["mse_loss"]) and torch.isfinite(p_out["idm_mse_loss"])
+    assert p_out["emb"][~padded_batch["valid_mask"]].abs().max().item() == 0.0
 
     # 3. Verify total loss + eval mode under torch.no_grad()
     model.zero_grad()

@@ -7,6 +7,9 @@ defaults:
 output_model_name: ebm_wm
 subdir: ${output_model_name}   # deterministic run dir for automatic resume
 
+data_mode: episode             # "episode" (full episodes, fast + in-dist 25/50-step planning) | "window" (LeWM T=4)
+max_ep_frames: 64              # max frames per episode at frameskip=5 (64 frames = 320 raw steps)
+
 training:
   auto_resume: true            # automatically resume from run_dir/last.ckpt if present
 
@@ -24,9 +27,10 @@ trainer:
   accelerator: gpu
   precision: bf16
   gradient_clip_val: 1.0
+  log_every_n_steps: 20
 
 loader:
-  batch_size: 128
+  batch_size: 8
   num_workers: ${num_workers}
   persistent_workers: True
   prefetch_factor: 3

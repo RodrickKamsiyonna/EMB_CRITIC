@@ -361,13 +361,16 @@ class EBMPlanSolver:
         langevin_noise_scale: float = 0.05,
         project_std_after_step: bool = False,
         final_denoise_steps: int = 0,
-        history_size: int = 3,
+        history_size: Optional[int] = 64,
+        shrink_horizon: bool = False,
         device: str = "cuda",
         seed: Optional[int] = None,
     ):
         self.model = model
         self.device = device
-        self.history_size = int(history_size)
+        self.history_size = int(history_size) if history_size is not None else None
+        self.shrink_horizon = bool(shrink_horizon)
+        self._steps_taken = 0
         self.planner = EBMLatentPlanner(
             model=model,
             n_steps=n_steps,
@@ -391,6 +394,7 @@ class EBMPlanSolver:
         """Called by stable_worldmodel.policy.WorldModelPolicy before evaluation."""
         self.n_envs = n_envs
         self.config = config
+        self._steps_taken = 0
         if action_space is not None and hasattr(action_space, "shape"):
             self.action_dim = int(action_space.shape[-1])
 
@@ -407,23 +411,39 @@ class EBMPlanSolver:
 
     def solve(self, info_dict: Dict[str, Any], init_action: Optional[torch.Tensor] = None) -> Dict[str, Any]:
         """Solve for a horizon-length sequence of action blocks given current info_dict."""
-        horizon = int(getattr(self.config, "horizon", 5)) if self.config is not None else 5
+        base_horizon = int(getattr(self.config, "horizon", 5)) if self.config is not None else 5
+        receding = int(getattr(self.config, "receding_horizon", base_horizon)) if self.config is not None else base_horizon
 
         obs_pixels = self._normalize_pixels(info_dict["pixels"])
-        # Keep the most recent `history_size` observed states (past first state + latest observations)
-        if obs_pixels.size(1) > self.history_size:
+        # Keep observed history (up to history_size, e.g. 64 frames for full-episode EBM)
+        if self.history_size is not None and obs_pixels.size(1) > self.history_size:
             obs_pixels = obs_pixels[:, -self.history_size :]
 
         goal_pixels = self._normalize_pixels(info_dict["goal"])[:, -1:]
 
+        plan_horizon = (
+            max(1, base_horizon - self._steps_taken)
+            if self.shrink_horizon
+            else base_horizon
+        )
+
         out = self.planner.plan_from_pixels(
             obs_pixels=obs_pixels,
             goal_pixels=goal_pixels,
-            horizon=horizon,
+            horizon=plan_horizon,
         )
+        actions = out["actions"]
+        # Pad actions back to base_horizon if caller expects fixed (B, base_horizon, A) shape
+        if actions.size(1) < base_horizon:
+            pad = actions[:, -1:].expand(-1, base_horizon - actions.size(1), -1)
+            actions = torch.cat([actions, pad], dim=1)
+
+        if self.shrink_horizon:
+            self._steps_taken += min(receding, plan_horizon)
+
         self.last_metrics = out["metrics"]
         return {
-            "actions": out["actions"],
+            "actions": actions,
             "best_traj": out["best_traj"],
             "best_energy": out["best_energy"],
             "metrics": out["metrics"],

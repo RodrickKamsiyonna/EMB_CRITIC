@@ -1,11 +1,16 @@
 """Training script for EBM World Model + ResNet-18 + IDM (based on LeWM).
 
 Supports:
+- Full-episode training (`data_mode=episode`, default): encodes each episode frame once per
+  epoch at `frameskip=5` with dynamic batch padding (`valid_mask`), ~20-25x faster per epoch
+  and in-distribution for 25-step (5-frame), 50-step (10-frame), and 50-frame planning.
+- Legacy sliding-window mode (`data_mode=window`) matching LeWM's T=4 window.
+- Explicit WandB & JSONL logging of `train/mse_loss`, `val/mse_loss`, `train/idm_mse_loss`,
+  `val/idm_mse_loss`, `sigreg_loss`, energy landscape gaps, effective rank, and inpainting.
 - Per-step checkpointing every `logging.save_every_n_steps` steps (default: 1000),
   keeping ONLY the latest checkpoint (`last.ckpt` + `weights_latest.pt`).
-- Automatic resume from `run_dir/last.ckpt` (including seamless WandB run resume).
-- Exact mid-epoch dataset resume via `ResumableDistributedSampler` + `ResumableDatasetCallback`
-  (works identically on single GPU and multi-GPU DDP).
+- Automatic resume from `run_dir/last.ckpt` (including WandB run ID and exact mid-epoch
+  dataset position via `ResumableDistributedSampler`).
 """
 
 from __future__ import annotations
@@ -26,6 +31,7 @@ from lightning.pytorch.loggers import WandbLogger
 from omegaconf import OmegaConf, open_dict
 
 from ebm_modules import compute_effective_rank
+from episode_dataset import EpisodeHDF5Dataset, pad_episode_collate
 from module import SIGReg
 from planner import EBMLatentPlanner
 from resumable_sampler import ResumableDistributedSampler
@@ -33,7 +39,7 @@ from utils import get_column_normalizer, get_img_preprocessor
 
 
 def ebm_forward(self, batch, stage, cfg):
-    """Forward step for EBMWorldModel: denoising EBM + SIGReg + detached IDM + research logs."""
+    """Forward step for EBMWorldModel: denoising EBM MSE + SIGReg + detached IDM + research logs."""
     # stable_pretraining passes stage="fit" for train and stage="validate" for val
     stage_name = (
         "train" if stage in ("fit", "train")
@@ -61,8 +67,14 @@ def ebm_forward(self, batch, stage, cfg):
     if stage_name == "val" and hasattr(self, "_val_probe_cache"):
         cache = self._val_probe_cache
         if cache["n_batches"] < cfg.logging.val_probe_max_batches:
-            cache["embs"].append(output["emb"].detach().float().cpu())
-            cache["actions"].append(batch["action"].detach().float().cpu())
+            embs = output["emb"].detach().float().cpu()
+            acts = batch["action"].detach().float().cpu()
+            vm = batch.get("valid_mask", None)
+            if vm is None:
+                vm = torch.ones(embs.shape[:2], dtype=torch.bool)
+            else:
+                vm = vm.detach().bool().cpu()
+            cache["batches"].append((embs, acts, vm))
             cache["n_batches"] += 1
 
     return output
@@ -92,7 +104,6 @@ class ResumableDatasetCallback(Callback):
             and cur_epoch == self.resumed_epoch
             and 0 < self.batches_seen_in_epoch < full_batches
         ):
-            # Arm exact mid-epoch batch offset; keep batches_seen_in_epoch accumulating from here
             self.train_sampler.set_resume(cur_epoch, self.batches_seen_in_epoch)
             if trainer.is_global_zero:
                 print(
@@ -117,8 +128,6 @@ class ResumableDatasetCallback(Callback):
         }
 
     def load_state_dict(self, state_dict):
-        # Defer arming the sampler until on_train_epoch_start so Lightning's
-        # pre-fit `estimated_stepping_batches` sees the true full epoch length.
         self.last_epoch = int(state_dict.get("epoch", 0))
         self.batches_seen_in_epoch = int(state_dict.get("batches_seen_in_epoch", 0))
         self.resumed_epoch = self.last_epoch
@@ -174,7 +183,7 @@ class EBMResearchCallback(Callback):
         self.metrics_file = self.run_dir / "metrics.jsonl"
 
     def on_fit_start(self, trainer, pl_module):
-        pl_module._val_probe_cache = {"embs": [], "actions": [], "n_batches": 0}
+        pl_module._val_probe_cache = {"batches": [], "n_batches": 0}
         if trainer.is_global_zero:
             model = pl_module.model
             counts = {
@@ -196,7 +205,7 @@ class EBMResearchCallback(Callback):
             )
 
     def on_validation_epoch_start(self, trainer, pl_module):
-        pl_module._val_probe_cache = {"embs": [], "actions": [], "n_batches": 0}
+        pl_module._val_probe_cache = {"batches": [], "n_batches": 0}
 
     def on_validation_epoch_end(self, trainer, pl_module):
         if trainer.sanity_checking or not trainer.is_global_zero:
@@ -205,54 +214,78 @@ class EBMResearchCallback(Callback):
         cache = getattr(pl_module, "_val_probe_cache", None)
         extra_metrics = {}
 
-        if cache and len(cache["embs"]) > 0:
+        if cache and len(cache["batches"]) > 0:
             device = pl_module.device
             model = pl_module.model
-            all_embs = torch.cat(cache["embs"], dim=0)
-            all_acts = torch.cat(cache["actions"], dim=0)
-
-            extra_metrics["val_probe/effective_rank"] = float(compute_effective_rank(all_embs).item())
-
-            probe_n = min(all_embs.size(0), int(self.cfg.logging.val_probe_samples))
             model_dtype = next(model.ebm.parameters()).dtype
-            sample_embs = all_embs[:probe_n].to(device=device, dtype=model_dtype)
-            sample_acts = all_acts[:probe_n].to(device=device, dtype=torch.float32)
+
+            # 1. Effective rank over all valid unpadded tokens across stashed val batches
+            valid_token_chunks = [embs[vm] for embs, _, vm in cache["batches"]]
+            all_valid_tokens = torch.cat(valid_token_chunks, dim=0)
+            extra_metrics["val_probe/effective_rank"] = float(
+                compute_effective_rank(all_valid_tokens).item()
+            )
+
+            # 2. Temporal dynamics energy gap on first stashed val batch (handles variable lengths)
+            embs0, acts0, vm0 = cache["batches"][0]
+            probe_n = min(embs0.size(0), int(self.cfg.logging.val_probe_samples))
+            sample_embs = embs0[:probe_n].to(device=device, dtype=model_dtype)
+            sample_acts = acts0[:probe_n].to(device=device, dtype=torch.float32)
+            sample_vm = vm0[:probe_n].to(device=device)
 
             was_training = model.training
             model.eval()
             with torch.no_grad():
-                e_real, _ = model.compute_energy(sample_embs)
-                e_rev, _ = model.compute_energy(torch.flip(sample_embs, dims=[1]))
-                shuf = sample_embs.clone()
+                e_real, _ = model.compute_energy(sample_embs, valid_mask=sample_vm)
+
+                # Reverse only each episode's valid prefix
+                rev_embs = sample_embs.clone()
+                for i in range(probe_n):
+                    l_i = int(sample_vm[i].sum().item())
+                    if l_i > 1:
+                        rev_embs[i, :l_i] = torch.flip(sample_embs[i, :l_i], dims=[0])
+                e_rev, _ = model.compute_energy(rev_embs, valid_mask=sample_vm)
+
+                # Cross-episode shuffle over valid timesteps
+                shuf_embs = sample_embs.clone()
                 if probe_n > 1:
-                    for t_idx in range(1, shuf.size(1)):
+                    min_valid = int(sample_vm.sum(dim=1).min().item())
+                    for t_idx in range(1, min_valid):
                         perm = torch.roll(torch.arange(probe_n, device=device), shifts=t_idx)
-                        shuf[:, t_idx] = sample_embs[perm, t_idx]
-                e_shuf, _ = model.compute_energy(shuf)
+                        shuf_embs[:, t_idx] = sample_embs[perm, t_idx]
+                e_shuf, _ = model.compute_energy(shuf_embs, valid_mask=sample_vm)
 
                 extra_metrics["val_probe/energy_real"] = float(e_real.mean().item())
                 extra_metrics["val_probe/energy_reversed"] = float(e_rev.mean().item())
                 extra_metrics["val_probe/energy_shuffled"] = float(e_shuf.mean().item())
-                extra_metrics["val_probe/energy_gap_rev_minus_real"] = float((e_rev - e_real).mean().item())
-                extra_metrics["val_probe/energy_gap_shuf_minus_real"] = float((e_shuf - e_real).mean().item())
+                extra_metrics["val_probe/energy_gap_rev_minus_real"] = float(
+                    (e_rev - e_real).mean().item()
+                )
+                extra_metrics["val_probe/energy_gap_shuf_minus_real"] = float(
+                    (e_shuf - e_real).mean().item()
+                )
 
+            # 3. Periodic trajectory-inpainting planning probe (e.g. 5-step / 25-raw-step horizon)
             every_n = int(self.cfg.logging.val_inpaint_every_n_epochs)
             epoch_num = trainer.current_epoch + 1
             if every_n > 0 and (epoch_num % every_n == 0 or epoch_num == trainer.max_epochs):
-                inpaint_n = min(probe_n, int(self.cfg.logging.val_inpaint_samples))
-                planner = EBMLatentPlanner(
-                    model=model,
-                    n_steps=int(self.cfg.logging.val_inpaint_steps),
-                    lr=float(self.cfg.logging.val_inpaint_lr),
-                    num_samples=int(self.cfg.logging.val_inpaint_restarts),
-                    init_noise_std=float(self.cfg.logging.val_inpaint_noise_std),
-                    seed=int(self.cfg.seed),
-                )
-                inpaint_metrics = planner.validate_inpainting(
-                    clean_emb=sample_embs[:inpaint_n],
-                    true_actions=sample_acts[:inpaint_n],
-                )
-                extra_metrics.update(inpaint_metrics)
+                min_valid = int(sample_vm.sum(dim=1).min().item())
+                probe_len = min(min_valid, 6)  # 6 frames = 5 macro-steps (25 raw steps at frameskip=5)
+                if probe_len >= 3:
+                    inpaint_n = min(probe_n, int(self.cfg.logging.val_inpaint_samples))
+                    planner = EBMLatentPlanner(
+                        model=model,
+                        n_steps=int(self.cfg.logging.val_inpaint_steps),
+                        lr=float(self.cfg.logging.val_inpaint_lr),
+                        num_samples=int(self.cfg.logging.val_inpaint_restarts),
+                        init_noise_std=float(self.cfg.logging.val_inpaint_noise_std),
+                        seed=int(self.cfg.seed),
+                    )
+                    inpaint_metrics = planner.validate_inpainting(
+                        clean_emb=sample_embs[:inpaint_n, :probe_len],
+                        true_actions=sample_acts[:inpaint_n, :probe_len],
+                    )
+                    extra_metrics.update(inpaint_metrics)
 
             if was_training:
                 model.train()
@@ -288,36 +321,100 @@ def _get_or_create_wandb_id(run_dir: Path, auto_resume: bool) -> str:
     return new_id
 
 
+def _resolve_h5_path(dataset_name: str, cache_dir: str | None) -> Path:
+    p = Path(dataset_name)
+    if p.is_absolute() and p.exists():
+        return p
+    datasets_dir = swm.data.utils.get_cache_dir(cache_dir, sub_folder="datasets")
+    cand = Path(datasets_dir) / dataset_name
+    if cand.exists():
+        return cand
+    if not cand.suffix:
+        cand_h5 = cand.with_suffix(".h5")
+        if cand_h5.exists():
+            return cand_h5
+    raise FileNotFoundError(f"Could not locate HDF5 dataset '{dataset_name}' (checked {p} and {cand})")
+
+
 @hydra.main(version_base=None, config_path="./config/train", config_name="ebm")
 def run(cfg):
     #########################
     ##       dataset       ##
     #########################
 
-    dataset_cfg = OmegaConf.to_container(cfg.data.dataset, resolve=True)
-    dataset_name = dataset_cfg.pop("name")
+    data_mode = str(cfg.get("data_mode", "episode")).lower()
     cache_dir = os.environ.get("LOCAL_DATASET_DIR", None)
-    dataset = swm.data.load_dataset(
-        dataset_name, transform=None, cache_dir=cache_dir, **dataset_cfg
-    )
-    transforms = [get_img_preprocessor(source="pixels", target="pixels", img_size=cfg.img_size)]
+    loader_kwargs = OmegaConf.to_container(cfg.loader, resolve=True)
+    collate_fn = None
 
-    with open_dict(cfg):
-        for col in cfg.data.dataset.keys_to_load:
-            if col.startswith("pixels"):
-                continue
-            normalizer = get_column_normalizer(dataset, col, col)
-            transforms.append(normalizer)
+    if data_mode == "episode":
+        h5_path = _resolve_h5_path(str(cfg.data.dataset.name), cache_dir)
+        frameskip = int(cfg.data.dataset.frameskip)
+        max_ep_frames = int(cfg.get("max_ep_frames", 64))
 
-        cfg.model.idm.action_dim = cfg.data.dataset.frameskip * dataset.get_dim("action")
+        full_train_ds = EpisodeHDF5Dataset(
+            h5_path=h5_path,
+            frameskip=frameskip,
+            img_size=int(cfg.img_size),
+            max_ep_frames=max_ep_frames,
+            random_crop=True,
+        )
+        full_val_ds = EpisodeHDF5Dataset(
+            h5_path=h5_path,
+            frameskip=frameskip,
+            img_size=int(cfg.img_size),
+            max_ep_frames=max_ep_frames,
+            random_crop=False,
+            action_mean=full_train_ds.action_mean,
+            action_std=full_train_ds.action_std,
+        )
 
-    transform = spt.data.transforms.Compose(*transforms)
-    dataset.transform = transform
+        # Deterministic episode-level 90/10 split (zero episode overlap between train & val)
+        n_eps = len(full_train_ds)
+        n_train = max(1, int(round(n_eps * float(cfg.train_split))))
+        if n_train >= n_eps:
+            n_train = max(1, n_eps - 1)
+        g_split = torch.Generator().manual_seed(int(cfg.seed))
+        perm = torch.randperm(n_eps, generator=g_split).tolist()
+        train_set = torch.utils.data.Subset(full_train_ds, perm[:n_train])
+        val_set = torch.utils.data.Subset(full_val_ds, perm[n_train:])
+        collate_fn = pad_episode_collate
 
-    rnd_gen = torch.Generator().manual_seed(cfg.seed)
-    train_set, val_set = spt.data.random_split(
-        dataset, lengths=[cfg.train_split, 1 - cfg.train_split], generator=rnd_gen
-    )
+        with open_dict(cfg):
+            cfg.model.idm.action_dim = full_train_ds.action_dim
+
+        rank = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", 0)))
+        if rank == 0:
+            print(
+                f"[EBM-WM] Episode mode: {len(train_set)} train eps / {len(val_set)} val eps "
+                f"(frameskip={frameskip}, max_ep_frames={max_ep_frames}, action_dim={full_train_ds.action_dim})"
+            )
+
+    elif data_mode == "window":
+        dataset_cfg = OmegaConf.to_container(cfg.data.dataset, resolve=True)
+        dataset_name = dataset_cfg.pop("name")
+        dataset = swm.data.load_dataset(
+            dataset_name, transform=None, cache_dir=cache_dir, **dataset_cfg
+        )
+        transforms = [get_img_preprocessor(source="pixels", target="pixels", img_size=cfg.img_size)]
+
+        with open_dict(cfg):
+            for col in cfg.data.dataset.keys_to_load:
+                if col.startswith("pixels"):
+                    continue
+                normalizer = get_column_normalizer(dataset, col, col)
+                transforms.append(normalizer)
+
+            cfg.model.idm.action_dim = cfg.data.dataset.frameskip * dataset.get_dim("action")
+
+        dataset.transform = spt.data.transforms.Compose(*transforms)
+
+        rnd_gen = torch.Generator().manual_seed(cfg.seed)
+        train_set, val_set = spt.data.random_split(
+            dataset, lengths=[cfg.train_split, 1 - cfg.train_split], generator=rnd_gen
+        )
+    else:
+        raise ValueError(f"Unsupported data_mode='{data_mode}'. Use 'episode' or 'window'.")
 
     # Deterministic, DDP-aware resumable samplers so mid-epoch resume continues at the exact batch
     train_sampler = ResumableDistributedSampler(
@@ -335,12 +432,12 @@ def run(cfg):
         drop_last=False,
     )
 
-    loader_kwargs = OmegaConf.to_container(cfg.loader, resolve=True)
     train = torch.utils.data.DataLoader(
         train_set,
         sampler=train_sampler,
         shuffle=False,
         drop_last=True,
+        collate_fn=collate_fn,
         **loader_kwargs,
     )
     val = torch.utils.data.DataLoader(
@@ -348,6 +445,7 @@ def run(cfg):
         sampler=val_sampler,
         shuffle=False,
         drop_last=False,
+        collate_fn=collate_fn,
         **loader_kwargs,
     )
 
@@ -438,12 +536,9 @@ def run(cfg):
         logger=logger,
         enable_checkpointing=True,
     )
-    # Expose gradient_clip_val_ for spt.Module's manual-optimization gradient clipping
     trainer.gradient_clip_val_ = grad_clip_val
     trainer.gradient_clip_algorithm_ = "norm"
 
-    # Call trainer.fit directly (bypassing spt.Manager, which overrides ModelCheckpoint dirpath
-    # into /root/.cache and defaults to weights_only=True on ckpt_path).
     trainer.fit(pl_module, datamodule=data_module, ckpt_path=resume_ckpt)
     return
 
