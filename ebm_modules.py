@@ -286,35 +286,40 @@ class TransformerBlock(nn.Module):
 
 
 class EnergyHead(nn.Module):
-    """Two-layer MLP mapping each final hidden state to a D-dim vector; L2 norm gives token energy."""
+    """Two-layer bias-free MLP mapping each hidden state h_t -> u_t = W_2 GELU(W_1 h_t) in R^D.
+
+    Both W_1 and W_2 are D x D (no biases by default). Token energy is the L2 norm
+    E_t = sqrt(sum_d u_{t,d}^2 + 1e-12).
+    """
 
     def __init__(
         self,
         embed_dim: int,
         hidden_dim: Optional[int] = None,
-        activation: str = "relu2",
-        eps: float = 1e-8,
+        activation: str = "gelu",
+        bias: bool = False,
+        eps: float = 1e-12,
     ):
         super().__init__()
-        h_dim = hidden_dim or (4 * embed_dim)
-        self.fc1 = nn.Linear(embed_dim, h_dim)
-        self.fc2 = nn.Linear(h_dim, embed_dim)
+        h_dim = hidden_dim or embed_dim
+        self.fc1 = nn.Linear(embed_dim, h_dim, bias=bias)
+        self.fc2 = nn.Linear(h_dim, embed_dim, bias=bias)
         self.activation = activation
         self.eps = eps
 
     def forward(self, h: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Return (token_energy: (B, T), energy_vec: (B, T, D))."""
         x = self.fc1(h)
-        if self.activation == "relu2":
-            x = F.relu(x).square()
-        elif self.activation == "gelu":
+        if self.activation == "gelu":
             x = F.gelu(x)
+        elif self.activation == "relu2":
+            x = F.relu(x).square()
         elif self.activation == "silu":
             x = F.silu(x)
         else:
             raise ValueError(f"Unsupported activation='{self.activation}'")
         vec = self.fc2(x)
-        # Compute L2 norm in float32 with epsilon for smooth second-order derivatives
+        # Compute L2 norm in float32 with 1e-12 epsilon for smooth second-order derivatives
         vec_f = vec.float()
         token_energy = torch.sqrt(vec_f.pow(2).sum(dim=-1) + self.eps)
         return token_energy, vec
@@ -341,9 +346,11 @@ class EBMTransformer(nn.Module):
         max_seq_len: int = 1024,
         qk_norm: bool = True,
         activation: str = "relu2",
+        energy_activation: str = "gelu",
+        energy_bias: bool = False,
         dropout: float = 0.0,
         rope_base: float = 10000.0,
-        energy_eps: float = 1e-8,
+        energy_eps: float = 1e-12,
     ):
         super().__init__()
         self.embed_dim = embed_dim
@@ -370,8 +377,9 @@ class EBMTransformer(nn.Module):
         )
         self.energy_head = EnergyHead(
             embed_dim=embed_dim,
-            hidden_dim=energy_mlp_dim or (4 * embed_dim),
-            activation=activation,
+            hidden_dim=energy_mlp_dim or embed_dim,
+            activation=energy_activation,
+            bias=energy_bias,
             eps=energy_eps,
         )
         self._init_weights()

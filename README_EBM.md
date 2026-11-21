@@ -14,7 +14,7 @@ Action-free Energy-Based World Model built on top of `le-wm` (`stable-worldmodel
    - **Causal RoPE Transformer (`EBMTransformer`):** RoPE, QK-RMSNorm, `ReLU²` MLP, causal self-attention, no vocab embedding / LM head / value-embedding table.
      - Default (`model=ebm_tiny`): 6 layers, `embed_dim=192`, 3 heads × `head_dim=64` (~15M total params, matching LeWM's tiny scale for fast single-A100 training).
      - Large preset (`model=ebm_large`): 15 layers, `embed_dim=1664`, 13 heads × `head_dim=128`, `max_seq_len=1024`.
-   - **Energy Head:** 2-layer MLP mapping each final hidden state to a $D$-dim vector; its L2 norm gives positive scalar token energy, summed over valid tokens to produce sequence energy $E(x)$.
+   - **Energy Head:** Bias-free 2-layer MLP $u_t = W_2\,\text{GELU}(W_1 h_t)$ with $W_1, W_2 \in \mathbb{R}^{D \times D}$; token energy is $E_t = \sqrt{\sum_{d=1}^D u_{t,d}^2 + 10^{-12}}$, summed across all positions (clean and corrupted) and batch elements to form $E(X)$.
    - **Denoising MSE:** $\hat{e} = \operatorname{sg}(x) - \frac{1}{\alpha}\nabla_x E(x)$ ($\alpha=1$): $x$ enters $E(x)$ **non-detached** (so $x$ still receives gradients through $\nabla_x E(x)$), while the additive skip term $x$ in $\hat{e}$ is detached so the MSE pushes gradients through $\nabla_x E(x)$ only; the target clean standardized embeddings are **non-detached**, averaged only over selected tokens and embedding dimensions (no $\gamma$ weighting).
 3. **Regularization & Inverse Dynamics Model**
    - **SIGReg** (from LeWM) applied to clean embeddings (`weight=0.09`).

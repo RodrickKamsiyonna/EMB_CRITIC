@@ -34,10 +34,13 @@ def build_tiny_model(embed_dim=192, action_dim=10):
         n_head=3,
         head_dim=64,
         mlp_dim=768,
-        energy_mlp_dim=768,
+        energy_mlp_dim=embed_dim,
         max_seq_len=1024,
         qk_norm=True,
         activation="relu2",
+        energy_activation="gelu",
+        energy_bias=False,
+        energy_eps=1e-12,
     )
     idm = InverseDynamicsModel(
         embed_dim=embed_dim,
@@ -283,15 +286,28 @@ def test_tiny_and_large_ebm_shapes():
         n_head=13,
         head_dim=128,
         mlp_dim=6656,
-        energy_mlp_dim=6656,
+        energy_mlp_dim=1664,
         max_seq_len=1024,
     )
     assert len(full_ebm.blocks) == 15
     assert full_ebm.n_head * full_ebm.head_dim == 1664
+    # Verify exact EnergyHead spec: W1, W2 are D x D with no biases, GELU, eps=1e-12
+    eh = full_ebm.energy_head
+    assert eh.fc1.weight.shape == (1664, 1664) and eh.fc1.bias is None
+    assert eh.fc2.weight.shape == (1664, 1664) and eh.fc2.bias is None
+    assert eh.activation == "gelu" and eh.eps == 1e-12
+
     n_full = sum(p.numel() for p in full_ebm.parameters())
     with torch.no_grad():
         se, te = full_ebm(torch.randn(1, 4, 1664))
     assert se.shape == (1,) and te.shape == (1, 4) and (te > 0).all()
+
+    # Regression test for 16-mixed AMP -> float32 validation probe / planner dtype cast
+    tiny.eval()
+    fp16_embs = torch.randn(2, 4, 192, dtype=torch.float16)
+    planner = EBMLatentPlanner(model=tiny, n_steps=2, num_samples=2, seed=0)
+    inpaint_fp16 = planner.validate_inpainting(fp16_embs, true_actions=torch.randn(2, 4, 10))
+    assert "val_inpaint/latent_mse" in inpaint_fp16
 
     print(
         f"[PASS] test_tiny_and_large_ebm_shapes "

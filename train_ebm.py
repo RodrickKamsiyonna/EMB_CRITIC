@@ -57,12 +57,12 @@ def ebm_forward(self, batch, stage, cfg):
     on_step = stage_name == "train"
     self.log_dict(log_payload, on_step=on_step, on_epoch=True, sync_dist=True)
 
-    # Stash a small validation sample for epoch-end research probes (erank, shuffle gap, inpainting)
+    # Stash a small validation sample (always float32) for epoch-end research probes
     if stage_name == "val" and hasattr(self, "_val_probe_cache"):
         cache = self._val_probe_cache
         if cache["n_batches"] < cfg.logging.val_probe_max_batches:
-            cache["embs"].append(output["emb"].detach().cpu())
-            cache["actions"].append(batch["action"].detach().cpu())
+            cache["embs"].append(output["emb"].detach().float().cpu())
+            cache["actions"].append(batch["action"].detach().float().cpu())
             cache["n_batches"] += 1
 
     return output
@@ -214,8 +214,9 @@ class EBMResearchCallback(Callback):
             extra_metrics["val_probe/effective_rank"] = float(compute_effective_rank(all_embs).item())
 
             probe_n = min(all_embs.size(0), int(self.cfg.logging.val_probe_samples))
-            sample_embs = all_embs[:probe_n].to(device)
-            sample_acts = all_acts[:probe_n].to(device)
+            model_dtype = next(model.ebm.parameters()).dtype
+            sample_embs = all_embs[:probe_n].to(device=device, dtype=model_dtype)
+            sample_acts = all_acts[:probe_n].to(device=device, dtype=torch.float32)
 
             was_training = model.training
             model.eval()

@@ -73,7 +73,7 @@ def main():
         "model.ebm.n_head=2",
         "model.ebm.head_dim=32",
         "model.ebm.mlp_dim=128",
-        "model.ebm.energy_mlp_dim=128",
+        "model.ebm.energy_mlp_dim=64",
         "model.idm.hidden_dim=64",
         "loss.sigreg.kwargs.num_proj=64",
         "trainer.accelerator=cpu",

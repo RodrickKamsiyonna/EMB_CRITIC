@@ -93,8 +93,9 @@ class EBMLatentPlanner:
         if goal_emb.ndim == 2:
             goal_emb = goal_emb.unsqueeze(1)
 
-        obs_fixed = obs_emb.detach()
-        goal_fixed = goal_emb[:, -1:].detach()  # (B, 1, D)
+        model_dtype = next(self.model.ebm.parameters()).dtype
+        obs_fixed = obs_emb.detach().to(dtype=model_dtype)
+        goal_fixed = goal_emb[:, -1:].detach().to(dtype=model_dtype)  # (B, 1, D)
         b, h_obs, d = obs_fixed.shape
         device = obs_fixed.device
         dtype = obs_fixed.dtype
@@ -298,9 +299,11 @@ class EBMLatentPlanner:
         b, t, d = clean_emb.shape
         if t < 3:
             return {}
-        obs_emb = clean_emb[:, :1].detach()
-        goal_emb = clean_emb[:, -1:].detach()
-        gt_mid = clean_emb[:, 1:-1].detach()
+        model_dtype = next(self.model.ebm.parameters()).dtype
+        clean_emb = clean_emb.detach().to(dtype=model_dtype)
+        obs_emb = clean_emb[:, :1]
+        goal_emb = clean_emb[:, -1:]
+        gt_mid = clean_emb[:, 1:-1]
 
         plan_out = self.plan_latents(obs_emb=obs_emb, goal_emb=goal_emb, horizon=t - 1)
         pred_mid = plan_out["best_traj"][:, 1:-1]
