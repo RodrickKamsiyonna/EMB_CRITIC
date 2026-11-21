@@ -26,7 +26,7 @@ trainer:
   devices: auto
   accelerator: gpu
   precision: bf16
-  gradient_clip_val: 1.0
+  gradient_clip_val: null
   log_every_n_steps: 20
 
 loader:
@@ -38,7 +38,7 @@ loader:
 
 optimizer:
   type: AdamW
-  lr: 5e-5
+  lr: 3e-4
   weight_decay: 1e-3
 
 loss:

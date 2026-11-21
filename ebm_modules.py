@@ -6,11 +6,11 @@ Architecture summary:
 - Corruption: per-sequence mask ratio r ~ U(0, 1) (at least 1 valid token selected),
   per-sequence gamma = sigmoid(z) with z ~ N(-1.5, 0.8^2),
   x = gamma * e + (1 - gamma) * eps (noise_scale=1.0) for selected tokens, clean e for unselected.
-- Backbone: Causal RoPE Transformer with internal pre-RMSNorm + final RMSNorm,
-  NO input RMSNorm on noisy inputs, NO vocab embedding or LM head.
+- Backbone: Causal RoPE Transformer with internal pre-RMSNorm,
+  NO input RMSNorm on noisy inputs, NO final RMSNorm before EnergyHead, NO vocab embedding or LM head.
 - Energy head: 2-layer MLP -> D-dim vector -> L2 norm (positive scalar token energy)
   -> sum over valid tokens = sequence energy E(x).
-- Denoising loss: e_hat = x - (1 / alpha) * grad_x E(x) (alpha = 1), plain MSE against
+- Denoising loss: e_hat = x - (1 / alpha) * grad_x E(x) (alpha = 1, non-detached x), plain MSE against
   NON-DETACHED clean standardized embeddings over selected tokens and embedding dims.
 - Regularization: SIGReg on clean embeddings (from LeWM).
 - Inverse Dynamics Model (IDM): predicts frameskip action chunk from detached
@@ -331,7 +331,7 @@ class EBMTransformer(nn.Module):
     Key design properties:
     - No vocabulary embedding table, no LM head, no auxiliary value-embedding table.
     - No input RMSNorm on noisy inputs entering block 0.
-    - Retains internal pre-RMSNorm in every block and final RMSNorm after last block.
+    - Retains internal pre-RMSNorm in every block; final RMSNorm before EnergyHead is disabled by default.
     - Two-layer MLP energy head -> D-dim vector -> L2 norm -> sum over tokens = E(x).
     """
 
@@ -345,6 +345,7 @@ class EBMTransformer(nn.Module):
         energy_mlp_dim: Optional[int] = None,
         max_seq_len: int = 1024,
         qk_norm: bool = True,
+        final_norm: bool = False,
         activation: str = "relu2",
         energy_activation: str = "gelu",
         energy_bias: bool = False,
@@ -358,6 +359,7 @@ class EBMTransformer(nn.Module):
         self.n_head = n_head
         self.head_dim = head_dim
         self.max_seq_len = max_seq_len
+        self.final_norm = bool(final_norm)
 
         self.rope = RotaryEmbedding(head_dim=head_dim, max_seq_len=max_seq_len, base=rope_base)
         self.blocks = nn.ModuleList(
@@ -406,8 +408,8 @@ class EBMTransformer(nn.Module):
         h = x
         for block in self.blocks:
             h = block(h, rope=self.rope, valid_mask=valid_mask)
-        # Final RMSNorm retained
-        h = rms_norm(h)
+        if self.final_norm:
+            h = rms_norm(h)
         token_energy, _ = self.energy_head(h)  # (B, T) in float32
 
         if valid_mask is not None:
@@ -461,7 +463,7 @@ class EBMWorldModel(nn.Module):
         logit_normal_mean: float = -1.5,
         logit_normal_std: float = 0.8,
         noise_scale: float = 1.0,
-        detach_x_skip: bool = True,
+        detach_x_skip: bool = False,
         detach_target: bool = False,
         detach_idm_input: bool = True,
         std_eps: float = 1e-6,
@@ -584,12 +586,11 @@ class EBMWorldModel(nn.Module):
         create_graph: Optional[bool] = None,
         detach_x_skip: Optional[bool] = None,
     ) -> Dict[str, torch.Tensor]:
-        """Compute energy and one-step gradient denoising e_hat = sg(x) - (1/alpha) * grad_x E(x).
+        """Compute energy and one-step gradient denoising e_hat = x - (1/alpha) * grad_x E(x).
 
-        x enters E(x) WITHOUT being detached (so x still receives gradients through grad_x E(x)
-        when create_graph=True). When detach_x_skip=True (default), only the additive skip term
-        x in e_hat = x.detach() - (1/alpha) * grad_x is detached so the MSE passes gradients
-        through grad_x E(x) rather than a direct skip path on x.
+        x enters E(x) WITHOUT being detached (so x receives gradients through grad_x E(x)
+        when create_graph=True). By default (detach_x_skip=False), the additive skip term x
+        is NOT detached either.
         """
         if create_graph is None:
             create_graph = self.training and torch.is_grad_enabled()

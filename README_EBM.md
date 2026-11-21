@@ -10,12 +10,12 @@ Action-free Energy-Based World Model built on top of `le-wm` (`stable-worldmodel
 2. **Corruption & Denoising Objective (`EBMWorldModel`)**
    - Masking ratio per sequence: $r \sim U(0, 1)$, each valid token selected independently with probability $r$ (if none selected, the first valid token is selected).
    - Noise scale per sequence (shared across selected tokens): $z \sim \mathcal{N}(-1.5, 0.8^2)$, $\gamma = \sigma(z)$ (median $\approx 0.182$), $x = \gamma e + (1 - \gamma)\epsilon$ (`noise_scale=1.0`), $\epsilon \sim \mathcal{N}(0, I)$. Unselected tokens retain clean standardized embeddings.
-   - Noisy inputs enter the Transformer **without** an input RMSNorm; internal block pre-RMSNorm and final RMSNorm are retained.
+   - Noisy inputs enter the Transformer **without** an input RMSNorm; internal block pre-RMSNorm is retained, and final RMSNorm before `EnergyHead` is disabled (`final_norm=false`).
    - **Causal RoPE Transformer (`EBMTransformer`):** RoPE, QK-RMSNorm, `ReLU²` MLP, causal self-attention, no vocab embedding / LM head / value-embedding table.
      - Default (`model=ebm_tiny`): 6 layers, `embed_dim=192`, 3 heads × `head_dim=64` (~15M total params, matching LeWM's tiny scale for fast single-A100 training).
      - Large preset (`model=ebm_large`): 15 layers, `embed_dim=1664`, 13 heads × `head_dim=128`, `max_seq_len=1024`.
    - **Energy Head:** Bias-free 2-layer MLP $u_t = W_2\,\text{GELU}(W_1 h_t)$ with $W_1, W_2 \in \mathbb{R}^{D \times D}$; token energy is $E_t = \sqrt{\sum_{d=1}^D u_{t,d}^2 + 10^{-12}}$, summed across all positions (clean and corrupted) and batch elements to form $E(X)$.
-   - **Denoising MSE:** $\hat{e} = \operatorname{sg}(x) - \frac{1}{\alpha}\nabla_x E(x)$ ($\alpha=1$): $x$ enters $E(x)$ **non-detached** (so $x$ still receives gradients through $\nabla_x E(x)$), while the additive skip term $x$ in $\hat{e}$ is detached so the MSE pushes gradients through $\nabla_x E(x)$ only; the target clean standardized embeddings are **non-detached**, averaged only over selected tokens and embedding dimensions (no $\gamma$ weighting).
+   - **Denoising MSE:** $\hat{e} = x - \frac{1}{\alpha}\nabla_x E(x)$ ($\alpha=1$, neither $x$ nor the target clean standardized embeddings are detached), averaged only over selected tokens and embedding dimensions (no $\gamma$ weighting).
 3. **Regularization & Inverse Dynamics Model**
    - **SIGReg** (from LeWM) applied to clean embeddings (`weight=0.09`).
    - **IDM (`InverseDynamicsModel`):** trained on **detached** consecutive clean standardized embeddings $(e_t, e_{t+1})$ to predict the `frameskip * action_dim` action chunk between frames.

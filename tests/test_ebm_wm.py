@@ -130,10 +130,10 @@ def test_gradient_isolation_and_double_backward():
     # Inject a NaN action on last step to verify boundary NaN masking
     batch["action"][0, -1] = float("nan")
 
-    # 1. Verify exact gradient semantics for e_hat = x.detach() - (1/alpha) * grad_x E(x):
+    # 1. Verify exact gradient semantics for e_hat = x - (1/alpha) * grad_x E(x) (detach_x_skip=False):
     #    - x enters E(x) NON-DETACHED, so grad_x E(x) DOES backprop into encoder via x
-    #    - skip term x in e_hat IS detached, so d(e_hat)/d(encoder) == d(-(1/alpha)*grad_x)/d(encoder) EXACTLY
-    #    - denoise_loss flows into BOTH encoder and ebm, NOT idm
+    #    - skip term x in e_hat is NOT detached either, so d(e_hat)/d(encoder) == d(x - (1/alpha)*grad_x)/d(encoder)
+    #    - mse_loss flows into BOTH encoder and ebm, NOT idm
     model.train()
     model.zero_grad()
     _, clean_e = model.encode_pixels(batch["pixels"])
@@ -146,9 +146,12 @@ def test_gradient_isolation_and_double_backward():
     g_from_neg_gradx = torch.autograd.grad(
         ((-(1.0 / model.alpha) * d_out["grad_x"]) * probe).sum(), enc_params, retain_graph=True
     )
-    assert any(g.abs().max().item() > 0 for g in g_from_ehat), "x did not receive gradient through grad_x E(x)!"
-    for g1, g2 in zip(g_from_ehat, g_from_neg_gradx):
-        assert torch.allclose(g1, g2, atol=1e-5, rtol=1e-4), "Skip term x was NOT detached in e_hat!"
+    g_from_x_minus_gradx = torch.autograd.grad(
+        ((corrupt["x"] - (1.0 / model.alpha) * d_out["grad_x"]) * probe).sum(), enc_params, retain_graph=True
+    )
+    assert any(g.abs().max().item() > 0 for g in g_from_neg_gradx), "x did not receive gradient through grad_x E(x)!"
+    for g1, g2 in zip(g_from_ehat, g_from_x_minus_gradx):
+        assert torch.allclose(g1, g2, atol=1e-5, rtol=1e-4), "e_hat != x - (1/alpha)*grad_x!"
 
     model.zero_grad()
     out = model.compute_losses(batch, sigreg=sigreg, sigreg_weight=0.0, idm_weight=0.0)
