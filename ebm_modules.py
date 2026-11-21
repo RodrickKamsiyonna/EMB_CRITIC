@@ -5,7 +5,7 @@ Architecture summary:
 - Per-token standardization: each clean embedding is centered and divided by its own std.
 - Corruption: per-sequence mask ratio r ~ U(0, 1) (at least 1 valid token selected),
   per-sequence gamma = sigmoid(z) with z ~ N(-1.5, 0.8^2),
-  x = gamma * e + (1 - gamma) * 2 * eps for selected tokens, clean e for unselected.
+  x = gamma * e + (1 - gamma) * eps (noise_scale=1.0) for selected tokens, clean e for unselected.
 - Backbone: Causal RoPE Transformer with internal pre-RMSNorm + final RMSNorm,
   NO input RMSNorm on noisy inputs, NO vocab embedding or LM head.
 - Energy head: 2-layer MLP -> D-dim vector -> L2 norm (positive scalar token energy)
@@ -460,7 +460,7 @@ class EBMWorldModel(nn.Module):
         alpha: float = 1.0,
         logit_normal_mean: float = -1.5,
         logit_normal_std: float = 0.8,
-        noise_scale: float = 2.0,
+        noise_scale: float = 1.0,
         detach_x_skip: bool = True,
         detach_target: bool = False,
         detach_idm_input: bool = True,
@@ -525,7 +525,7 @@ class EBMWorldModel(nn.Module):
         - Masking ratio: r ~ U(0, 1) per sequence; each valid token selected independently
           with probability r. If none selected in a sequence, select the first valid token.
         - Noise scale & bias: z ~ N(-1.5, 0.8^2) per sequence, gamma = sigmoid(z),
-          x = gamma * e + (1 - gamma) * 2 * eps for selected tokens, clean e otherwise.
+          x = gamma * e + (1 - gamma) * noise_scale * eps for selected tokens, clean e otherwise.
         """
         b, t, d = clean_emb.shape
         device = clean_emb.device

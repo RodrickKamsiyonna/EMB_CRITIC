@@ -9,7 +9,7 @@ Action-free Energy-Based World Model built on top of `le-wm` (`stable-worldmodel
    - Clean token embeddings are centered and divided by their own std across feature dimensions (`standardize_tokens`) before corruption.
 2. **Corruption & Denoising Objective (`EBMWorldModel`)**
    - Masking ratio per sequence: $r \sim U(0, 1)$, each valid token selected independently with probability $r$ (if none selected, the first valid token is selected).
-   - Noise scale per sequence (shared across selected tokens): $z \sim \mathcal{N}(-1.5, 0.8^2)$, $\gamma = \sigma(z)$ (median $\approx 0.182$), $x = \gamma e + (1 - \gamma)\cdot 2\epsilon$, $\epsilon \sim \mathcal{N}(0, I)$. Unselected tokens retain clean standardized embeddings.
+   - Noise scale per sequence (shared across selected tokens): $z \sim \mathcal{N}(-1.5, 0.8^2)$, $\gamma = \sigma(z)$ (median $\approx 0.182$), $x = \gamma e + (1 - \gamma)\epsilon$ (`noise_scale=1.0`), $\epsilon \sim \mathcal{N}(0, I)$. Unselected tokens retain clean standardized embeddings.
    - Noisy inputs enter the Transformer **without** an input RMSNorm; internal block pre-RMSNorm and final RMSNorm are retained.
    - **Causal RoPE Transformer (`EBMTransformer`):** RoPE, QK-RMSNorm, `ReLU²` MLP, causal self-attention, no vocab embedding / LM head / value-embedding table.
      - Default (`model=ebm_tiny`): 6 layers, `embed_dim=192`, 3 heads × `head_dim=64` (~15M total params, matching LeWM's tiny scale for fast single-A100 training).

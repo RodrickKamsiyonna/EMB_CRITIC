@@ -4,7 +4,7 @@ _target_: ebm_modules.EBMWorldModel
 alpha: 1.0
 logit_normal_mean: -1.5
 logit_normal_std: 0.8
-noise_scale: 2.0
+noise_scale: 1.0
 detach_x_skip: true        # Detach skip term x in e_hat = x.detach() - (1/alpha)*grad_x E(x); x enters E(x) non-detached
 detach_target: false       # Target clean standardized embeddings are NOT detached
 detach_idm_input: true     # IDM trains on detached clean standardized embeddings

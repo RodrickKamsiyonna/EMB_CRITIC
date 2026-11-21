@@ -54,7 +54,7 @@ def build_tiny_model(embed_dim=192, action_dim=10):
         alpha=1.0,
         logit_normal_mean=-1.5,
         logit_normal_std=0.8,
-        noise_scale=2.0,
+        noise_scale=1.0,
         detach_target=False,
         detach_idm_input=True,
     )
