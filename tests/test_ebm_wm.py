@@ -268,13 +268,40 @@ def test_open_loop_and_closed_loop_planning():
     # Verify first state was preserved in context when history grew beyond 3
     assert rollout["plan_logs"][-1]["ctx_len"] == 3
 
-    # 3. EBMPlanSolver adapter check
-    solver = EBMPlanSolver(model=model, n_steps=5, num_samples=2, device="cpu", seed=0)
+    # 3. EBMPlanSolver adapter & stable_worldmodel Solver protocol check
+    from typing import Any, Protocol, runtime_checkable
+
+    @runtime_checkable
+    class _SWMSolverProtocol(Protocol):
+        def configure(self, *, action_space: Any, n_envs: int, config: Any) -> None: ...
+        @property
+        def action_dim(self) -> int: ...
+        @property
+        def n_envs(self) -> int: ...
+        @property
+        def horizon(self) -> int: ...
+        def solve(self, info_dict: dict, init_action: torch.Tensor | None = None) -> dict: ...
+
+    class DummyActionSpace:
+        shape = (2, 2)
+
     class DummyCfg:
         horizon = 5
-    solver.configure(n_envs=2, config=DummyCfg())
-    res = solver.solve({"pixels": obs, "goal": goal})
+        receding_horizon = 1
+        action_block = 5
+
+    solver = EBMPlanSolver(model=model, n_steps=5, num_samples=2, device="cpu", seed=0)
+    solver.configure(action_space=DummyActionSpace(), n_envs=2, config=DummyCfg())
+    assert isinstance(solver, _SWMSolverProtocol), "EBMPlanSolver must satisfy SWM Solver protocol"
+    assert solver.n_envs == 2
+    assert solver.horizon == 5
+    assert solver.action_dim == 10
+    # Verify both .solve(...) and __call__(..., init_action=...) used by WorldModelPolicy
+    res = solver({"pixels": obs, "goal": goal}, init_action=None)
     assert res["actions"].shape == (2, 5, 10)
+    assert res["actions"].device.type == "cpu" and res["actions"].dtype == torch.float32
+    res2 = solver.solve({"pixels": obs, "goal": goal})
+    assert res2["actions"].shape == (2, 5, 10)
 
     # 4. Validation inpainting probe
     with torch.no_grad():

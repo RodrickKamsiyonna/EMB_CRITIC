@@ -385,18 +385,48 @@ class EBMPlanSolver:
             final_denoise_steps=final_denoise_steps,
             seed=seed,
         )
+        self._config = None
         self.config = None
-        self.n_envs = None
-        self.action_dim = None
+        self._action_space = None
+        self._n_envs: Optional[int] = None
+        self._action_dim: Optional[int] = None
         self.last_metrics: Dict[str, Any] = {}
 
-    def configure(self, *, action_space=None, n_envs: int = 1, config=None, **kwargs):
+    def configure(self, *, action_space=None, n_envs: int = 1, config=None, **kwargs) -> None:
         """Called by stable_worldmodel.policy.WorldModelPolicy before evaluation."""
-        self.n_envs = n_envs
+        self._action_space = action_space
+        self._n_envs = int(n_envs)
+        self._config = config
         self.config = config
         self._steps_taken = 0
-        if action_space is not None and hasattr(action_space, "shape"):
-            self.action_dim = int(action_space.shape[-1])
+        if action_space is not None and hasattr(action_space, "shape") and action_space.shape:
+            shape = action_space.shape
+            single_shape = shape[1:] if len(shape) > 1 else shape
+            self._action_dim = int(math.prod(single_shape))
+        else:
+            self._action_dim = None
+
+    @property
+    def n_envs(self) -> Optional[int]:
+        """Number of parallel environments being planned for."""
+        return self._n_envs
+
+    @property
+    def action_dim(self) -> int:
+        """Flattened action dimension including action_block grouping."""
+        if self._action_dim is None:
+            return int(self.model.idm.action_dim)
+        action_block = int(getattr(self._config, "action_block", 1)) if self._config is not None else 1
+        return self._action_dim * action_block
+
+    @property
+    def horizon(self) -> int:
+        """Planning horizon length in timesteps."""
+        return int(getattr(self._config, "horizon", 5)) if self._config is not None else 5
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+        """Make solver callable, forwarding to solve() (required by WorldModelPolicy)."""
+        return self.solve(*args, **kwargs)
 
     def _normalize_pixels(self, tensor: torch.Tensor) -> torch.Tensor:
         """Convert 4D/5D/6D pixel tensors into (B, T, C, H, W) on model device."""
@@ -407,12 +437,20 @@ class EBMPlanSolver:
             tensor = tensor[:, 0]
         elif tensor.ndim != 5:
             raise ValueError(f"Unsupported pixel tensor shape {tuple(tensor.shape)}")
-        return tensor.to(self.device)
+        try:
+            target_device = next(self.model.parameters()).device
+        except StopIteration:
+            target_device = self.device
+        return tensor.to(target_device)
 
     def solve(self, info_dict: Dict[str, Any], init_action: Optional[torch.Tensor] = None) -> Dict[str, Any]:
         """Solve for a horizon-length sequence of action blocks given current info_dict."""
-        base_horizon = int(getattr(self.config, "horizon", 5)) if self.config is not None else 5
-        receding = int(getattr(self.config, "receding_horizon", base_horizon)) if self.config is not None else base_horizon
+        base_horizon = self.horizon
+        receding = (
+            int(getattr(self._config, "receding_horizon", base_horizon))
+            if self._config is not None
+            else base_horizon
+        )
 
         obs_pixels = self._normalize_pixels(info_dict["pixels"])
         # Keep observed history (up to history_size, e.g. 64 frames for full-episode EBM)
@@ -443,9 +481,10 @@ class EBMPlanSolver:
 
         self.last_metrics = out["metrics"]
         return {
-            "actions": actions,
-            "best_traj": out["best_traj"],
-            "best_energy": out["best_energy"],
+            "actions": actions.detach().float().cpu(),
+            "costs": out["best_energy"].detach().float().cpu().tolist(),
+            "best_traj": out["best_traj"].detach(),
+            "best_energy": out["best_energy"].detach(),
             "metrics": out["metrics"],
         }
 
