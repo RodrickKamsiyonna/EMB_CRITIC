@@ -300,8 +300,25 @@ def test_open_loop_and_closed_loop_planning():
     res = solver({"pixels": obs, "goal": goal}, init_action=None)
     assert res["actions"].shape == (2, 5, 10)
     assert res["actions"].device.type == "cpu" and res["actions"].dtype == torch.float32
-    res2 = solver.solve({"pixels": obs, "goal": goal})
+    res2 = solver.solve({"pixels": torch.randn(2, 3, 3, 64, 64), "goal": goal})
     assert res2["actions"].shape == (2, 5, 10)
+
+    # Verify per-replan diagnostics & summary track every replan call (not just last_metrics)
+    summary = solver.get_diagnostics_summary()
+    assert summary["num_replans"] == 2
+    assert summary["num_ebm_plans"] == 2
+    assert summary["max_ctx_len"] == 3
+    assert summary["per_replan"][0]["ctx_len"] == 1
+    assert summary["per_replan"][1]["ctx_len"] == 3
+    assert summary["mean_over_ebm_plans"]["plan/energy_drop"] > 0.0
+    assert summary["mean_over_ebm_plans"]["plan/opt_z_norm"] > 0.0
+
+    # Verify chunked pixel encoding matches full-batch encoding
+    big_obs = torch.randn(2, 5, 3, 64, 64)
+    with torch.no_grad():
+        emb_full = planner._encode_pixels_chunked(big_obs, chunk_size=128)
+        emb_chunked = planner._encode_pixels_chunked(big_obs, chunk_size=3)
+    assert torch.allclose(emb_full, emb_chunked, atol=1e-5)
 
     # 4. Validation inpainting probe
     with torch.no_grad():

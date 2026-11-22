@@ -264,12 +264,28 @@ class EBMLatentPlanner:
             "metrics": metrics,
         }
 
+    def _encode_pixels_chunked(
+        self, pixels: torch.Tensor, chunk_size: int = 128
+    ) -> torch.Tensor:
+        """Encode (B, T, C, H, W) pixels into standardized embeddings (B, T, D) without OOM."""
+        b, t = pixels.shape[:2]
+        if b * t <= chunk_size:
+            _, emb = self.model.encode_pixels(pixels)
+            return emb
+        flat = pixels.reshape(b * t, *pixels.shape[2:])
+        chunks = []
+        for i in range(0, b * t, chunk_size):
+            _, emb_chunk = self.model.encode_pixels(flat[i : i + chunk_size])
+            chunks.append(emb_chunk)
+        return torch.cat(chunks, dim=0).reshape(b, t, -1)
+
     def plan_from_pixels(
         self,
         obs_pixels: torch.Tensor,
         goal_pixels: torch.Tensor,
         horizon: int,
         generator: Optional[torch.Generator] = None,
+        encode_batch_size: int = 128,
     ) -> Dict[str, Any]:
         """Encode observed history pixels and goal pixel frame, then plan."""
         if obs_pixels.ndim == 4:
@@ -278,8 +294,8 @@ class EBMLatentPlanner:
             goal_pixels = goal_pixels.unsqueeze(1)  # (B, 1, C, H, W)
 
         with torch.no_grad():
-            _, obs_emb = self.model.encode_pixels(obs_pixels)
-            _, goal_emb = self.model.encode_pixels(goal_pixels)
+            obs_emb = self._encode_pixels_chunked(obs_pixels, chunk_size=encode_batch_size)
+            goal_emb = self._encode_pixels_chunked(goal_pixels, chunk_size=encode_batch_size)
 
         return self.plan_latents(
             obs_emb=obs_emb,
@@ -391,6 +407,7 @@ class EBMPlanSolver:
         self._n_envs: Optional[int] = None
         self._action_dim: Optional[int] = None
         self.last_metrics: Dict[str, Any] = {}
+        self.plan_history: List[Dict[str, Any]] = []
 
     def configure(self, *, action_space=None, n_envs: int = 1, config=None, **kwargs) -> None:
         """Called by stable_worldmodel.policy.WorldModelPolicy before evaluation."""
@@ -399,6 +416,8 @@ class EBMPlanSolver:
         self._config = config
         self.config = config
         self._steps_taken = 0
+        self.last_metrics = {}
+        self.plan_history = []
         if action_space is not None and hasattr(action_space, "shape") and action_space.shape:
             shape = action_space.shape
             single_shape = shape[1:] if len(shape) > 1 else shape
@@ -480,12 +499,54 @@ class EBMPlanSolver:
             self._steps_taken += min(receding, plan_horizon)
 
         self.last_metrics = out["metrics"]
+        self.plan_history.append(
+            {
+                "replan_call": len(self.plan_history),
+                "plan_horizon": int(plan_horizon),
+                "ctx_len": int(obs_pixels.size(1)),
+                "n_envs_active": int(obs_pixels.size(0)),
+                **{k: v for k, v in out["metrics"].items() if k != "plan/energy_curve"},
+            }
+        )
         return {
             "actions": actions.detach().float().cpu(),
             "costs": out["best_energy"].detach().float().cpu().tolist(),
             "best_traj": out["best_traj"].detach(),
             "best_energy": out["best_energy"].detach(),
             "metrics": out["metrics"],
+        }
+
+    def get_diagnostics_summary(self) -> Dict[str, Any]:
+        """Return aggregated and per-replan diagnostics across the evaluation episode."""
+        if not self.plan_history:
+            return {}
+        ebm_calls = [r for r in self.plan_history if r["plan_horizon"] > 1]
+        agg_src = ebm_calls if ebm_calls else self.plan_history
+        scalar_keys = [
+            "plan/energy_init",
+            "plan/energy_final",
+            "plan/energy_drop",
+            "plan/best_energy",
+            "plan/median_energy",
+            "plan/grad_norm_init",
+            "plan/grad_norm_final",
+            "plan/opt_z_mean",
+            "plan/opt_z_std",
+            "plan/opt_z_norm",
+        ]
+        mean_metrics = {
+            k: float(sum(r[k] for r in agg_src if k in r) / max(1, sum(1 for r in agg_src if k in r)))
+            for k in scalar_keys
+            if any(k in r for r in agg_src)
+        }
+        return {
+            "num_replans": len(self.plan_history),
+            "num_ebm_plans": len(ebm_calls),
+            "max_ctx_len": max(r["ctx_len"] for r in self.plan_history),
+            "mean_over_ebm_plans": mean_metrics,
+            "first_replan": self.plan_history[0],
+            "last_replan": self.plan_history[-1],
+            "per_replan": self.plan_history,
         }
 
 

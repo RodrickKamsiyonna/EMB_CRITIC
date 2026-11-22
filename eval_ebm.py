@@ -47,6 +47,111 @@ def get_dataset(cfg, dataset_name):
     )
 
 
+class EBMWorldModelPolicy(swm.policy.WorldModelPolicy):
+    """WorldModelPolicy subclass that buffers strided per-env pixel history for causal EBM MPC.
+
+    In stable_worldmodel==0.1.1, WorldModelPolicy does not maintain a multi-frame observation
+    HistoryBuffer (each replan only receives the single latest frame T=1). This subclass records
+    observations at macro-step (`action_block`) boundaries so closed-loop EBM planning conditions
+    on the real observed trajectory `[e_0, e_1, ..., e_t]` up to `solver.history_size`.
+    """
+
+    def set_env(self, env) -> None:
+        super().set_env(env)
+        n_envs = getattr(env, "num_envs", 1)
+        self._ebm_history: list[list[torch.Tensor]] = [[] for _ in range(n_envs)]
+        self._ebm_step_count: list[int] = [0 for _ in range(n_envs)]
+        self._pending_flush: np.ndarray | None = None
+
+    def get_action(self, info_dict: dict, **kwargs) -> np.ndarray:
+        needs_flush = info_dict.get("_needs_flush")
+        if needs_flush is not None and hasattr(self, "_ebm_history"):
+            self._pending_flush = np.asarray(needs_flush, dtype=bool)
+            for i in range(len(self._ebm_history)):
+                if self._pending_flush[i]:
+                    self._ebm_history[i].clear()
+                    self._ebm_step_count[i] = 0
+        else:
+            self._pending_flush = None
+        try:
+            return super().get_action(info_dict, **kwargs)
+        finally:
+            self._pending_flush = None
+
+    def _prepare_info(self, info_dict: dict) -> dict[str, torch.Tensor]:
+        out = super()._prepare_info(info_dict)
+        # If a newer stable_worldmodel already manages HistoryBuffer, defer to it.
+        if (
+            getattr(self, "_history_buffer", None) is not None
+            or not hasattr(self, "_ebm_history")
+            or "pixels" not in out
+        ):
+            return out
+
+        pixels = out["pixels"]
+        if not torch.is_tensor(pixels):
+            return out
+        latest = pixels[:, -1] if pixels.ndim == 5 else pixels  # (n_envs, C, H, W)
+        n_envs = latest.shape[0]
+
+        terminated = out.get("terminated")
+        dead = (
+            np.asarray(terminated, dtype=bool)
+            if terminated is not None
+            else np.zeros(n_envs, dtype=bool)
+        )
+
+        stride = max(1, int(self.cfg.action_block))
+        max_hist = getattr(self.solver, "history_size", None)
+
+        for i in range(n_envs):
+            if dead[i]:
+                continue
+            if self._ebm_step_count[i] % stride == 0:
+                hist = self._ebm_history[i]
+                hist.append(latest[i].detach().cpu())
+                if max_hist is not None and len(hist) > max_hist:
+                    if max_hist >= 2:
+                        hist = [hist[0]] + hist[-(max_hist - 1) :]
+                    else:
+                        hist = hist[-max_hist:]
+                    self._ebm_history[i] = hist
+            self._ebm_step_count[i] += 1
+
+        needs_replan = any(
+            (
+                len(self._action_buffer[i]) == 0
+                or (self._pending_flush is not None and bool(self._pending_flush[i]))
+            )
+            and not dead[i]
+            for i in range(n_envs)
+        )
+        if not needs_replan:
+            return out
+
+        target_len = max(
+            (len(self._ebm_history[i]) for i in range(n_envs) if not dead[i]),
+            default=1,
+        )
+        if target_len <= 1:
+            return out
+
+        stacked = []
+        for i in range(n_envs):
+            hist = self._ebm_history[i]
+            if not hist:
+                frames = [latest[i].detach().cpu()] * target_len
+            elif len(hist) < target_len:
+                frames = [hist[0]] * (target_len - len(hist)) + hist
+            elif len(hist) > target_len:
+                frames = [hist[0]] + hist[-(target_len - 1) :] if target_len >= 2 else hist[-1:]
+            else:
+                frames = hist
+            stacked.append(torch.stack(frames, dim=0))
+        out["pixels"] = torch.stack(stacked, dim=0)  # (n_envs, target_len, C, H, W)
+        return out
+
+
 @hydra.main(version_base=None, config_path="./config/eval", config_name="pusht_ebm_closedloop")
 def run(cfg: DictConfig):
     """Run open-loop or closed-loop EBM latent planning evaluation."""
@@ -100,7 +205,7 @@ def run(cfg: DictConfig):
         model.requires_grad_(False)
         config = swm.PlanConfig(**cfg.plan_config)
         solver = hydra.utils.instantiate(cfg.solver, model=model)
-        policy = swm.policy.WorldModelPolicy(
+        policy = EBMWorldModelPolicy(
             solver=solver, config=config, process=process, transform=transform
         )
     else:
@@ -149,15 +254,30 @@ def run(cfg: DictConfig):
     )
     end_time = time.time()
 
-    solver_metrics = {}
-    if solver is not None and hasattr(solver, "last_metrics"):
-        solver_metrics = {
+    solver_summary = {}
+    if solver is not None and hasattr(solver, "get_diagnostics_summary"):
+        solver_summary = solver.get_diagnostics_summary()
+    elif solver is not None and hasattr(solver, "last_metrics"):
+        solver_summary = {
             k: v for k, v in solver.last_metrics.items() if k != "plan/energy_curve"
         }
 
     print("[EBM-Eval] Environment metrics:", metrics)
-    if solver_metrics:
-        print("[EBM-Eval] Last planner diagnostics:", json.dumps(solver_metrics, indent=2))
+    if solver_summary:
+        per_replan = solver_summary.get("per_replan", [])
+        if per_replan:
+            print("[EBM-Eval] Per-replan diagnostics:")
+            for r in per_replan:
+                print(
+                    f"  call={r['replan_call']:2d} | H={r['plan_horizon']} | ctx={r['ctx_len']:2d} | "
+                    f"envs={r['n_envs_active']:2d} | "
+                    f"E: {r['plan/energy_init']:.2f}->{r['plan/energy_final']:.2f} "
+                    f"(drop={r['plan/energy_drop']:.2f}, best={r['plan/best_energy']:.2f}) | "
+                    f"grad: {r['plan/grad_norm_init']:.3f}->{r['plan/grad_norm_final']:.3f} | "
+                    f"z_std={r['plan/opt_z_std']:.3f} z_norm={r['plan/opt_z_norm']:.2f}"
+                )
+        summary_view = {k: v for k, v in solver_summary.items() if k != "per_replan"}
+        print("[EBM-Eval] Planner summary:", json.dumps(summary_view, indent=2))
 
     out_file = results_path / cfg.output.filename
     out_file.parent.mkdir(parents=True, exist_ok=True)
@@ -167,7 +287,7 @@ def run(cfg: DictConfig):
         f.write("\n==== RESULTS ====\n")
         f.write(f"mode: {mode}\n")
         f.write(f"metrics: {metrics}\n")
-        f.write(f"planner_diagnostics: {json.dumps(solver_metrics)}\n")
+        f.write(f"planner_diagnostics: {json.dumps(solver_summary)}\n")
         f.write(f"evaluation_time: {end_time - start_time:.2f} seconds\n")
 
 
