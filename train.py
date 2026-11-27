@@ -15,7 +15,7 @@ from utils import get_column_normalizer, get_img_preprocessor, SaveCkptCallback
 
 
 def lejepa_forward(self, batch, stage, cfg):
-    """encode observations, predict next states, compute losses."""
+    """Encode observations into beliefs, unroll multi-step predictions, compute losses."""
 
     ctx_len = cfg.history_size
     n_preds = cfg.num_preds
@@ -26,19 +26,54 @@ def lejepa_forward(self, batch, stage, cfg):
 
     output = self.model.encode(batch)
 
-    emb = output["emb"]  # (B, T, D)
+    belief = output["belief"]  # (B, T, D)
+    frame_emb = output["frame_emb"]  # (B, T, D)
     act_emb = output["act_emb"]
 
-    ctx_emb = emb[:, :ctx_len]
-    ctx_act = act_emb[:, : ctx_len]
+    if self.model.belief_encoder is not None:
+        # Multi-step belief rollout: from every b_t, autoregressively unroll the
+        # predictor to predict all future beliefs b_{t+k} ahead of it (up to
+        # cfg.rollout_steps if set, otherwise all T - 1 steps ahead).
+        T = belief.size(1)
+        max_rollout_steps = cfg.get("rollout_steps", None)
+        num_rollout_steps = (
+            T - 1 if max_rollout_steps is None else min(max_rollout_steps, T - 1)
+        )
+        assert num_rollout_steps >= 1, f"Need at least 2 timesteps, got T={T}"
 
-    tgt_emb = emb[:, n_preds:] # label
-    pred_emb = self.model.predict(ctx_emb, ctx_act) # pred
+        sq_errors = []
+        pred = belief[:, :-1]  # starting beliefs b_0 .. b_{T-2}
+        for k in range(1, num_rollout_steps + 1):
+            state_in = pred if k == 1 else pred[:, :-1]
+            act_in = act_emb[:, k - 1 : T - 1]
+            pred = self.model.predict(state_in, act_in)
+            tgt = belief[:, k:]
+            sq_errors.append((pred - tgt).pow(2))
 
-    # LeWM loss
-    output["pred_loss"] = (pred_emb - tgt_emb).pow(2).mean()
-    output["sigreg_loss"]= self.sigreg(emb.transpose(0, 1))
-    output["loss"] = output["pred_loss"] + lambd * output["sigreg_loss"]  
+        output["pred_loss"] = torch.cat(sq_errors, dim=1).mean()
+    else:
+        ctx_belief = belief[:, :ctx_len]
+        ctx_act = act_emb[:, :ctx_len]
+        tgt_belief = belief[:, n_preds:]
+        pred_belief = self.model.predict(ctx_belief, ctx_act)
+        output["pred_loss"] = (pred_belief - tgt_belief).pow(2).mean()
+
+    # Per-timestep belief SIGReg (independent across batch at each temporal position)
+    output["sigreg_loss"] = self.sigreg(belief.transpose(0, 1))
+    output["loss"] = output["pred_loss"] + lambd * output["sigreg_loss"]
+
+    # Optional frame-level SIGReg (disabled by default)
+    frame_sigreg_cfg = cfg.loss.get("frame_sigreg", None)
+    if (
+        frame_sigreg_cfg is not None
+        and frame_sigreg_cfg.get("enabled", False)
+        and frame_sigreg_cfg.get("weight", 0.0) > 0
+    ):
+        output["frame_sigreg_loss"] = self.sigreg(frame_emb.transpose(0, 1))
+        output["loss"] = (
+            output["loss"]
+            + frame_sigreg_cfg.get("weight", 0.0) * output["frame_sigreg_loss"]
+        )
 
     losses_dict = {f"{stage}/{k}": v.detach() for k, v in output.items() if "loss" in k}
     self.log_dict(losses_dict, on_step=True, sync_dist=True)

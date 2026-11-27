@@ -8,18 +8,29 @@ encoder:
   pretrained: false
   use_mask_token: false
 
-predictor:
-  _target_: module.ARPredictor
-  num_frames: ${history_size}
+belief_encoder:
+  _target_: module.BeliefEncoder
+  num_frames: ${data.dataset.num_steps}
   input_dim: ${embed_dim}
   hidden_dim: ${embed_dim}
   output_dim: ${embed_dim}
-  depth: 6
-  heads: 16
-  mlp_dim: 2048
+  depth: 4
+  heads: 8
+  mlp_dim: 768
   dim_head: 64
   dropout: 0.1
   emb_dropout: 0.0
+  use_pos_emb: true
+
+predictor:
+  _target_: module.BeliefPredictor
+  input_dim: ${embed_dim}
+  hidden_dim: ${embed_dim}
+  output_dim: ${embed_dim}
+  cond_dim: ${embed_dim}
+  depth: 6
+  mlp_dim: 2048
+  dropout: 0.1
 
 action_encoder:
   _target_: module.Embedder

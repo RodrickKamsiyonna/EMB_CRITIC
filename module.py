@@ -283,3 +283,136 @@ class ARPredictor(nn.Module):
         x = self.dropout(x)
         x = self.transformer(x, c)
         return x
+
+
+class BeliefEncoder(nn.Module):
+    """Causal transformer mapping frame embeddings z_{<=t} to beliefs b_t."""
+
+    def __init__(
+        self,
+        *,
+        num_frames,
+        depth,
+        heads,
+        mlp_dim,
+        input_dim,
+        hidden_dim,
+        output_dim=None,
+        dim_head=64,
+        dropout=0.0,
+        emb_dropout=0.0,
+        use_pos_emb=True,
+    ):
+        super().__init__()
+        self.num_frames = num_frames
+        self.use_pos_emb = use_pos_emb
+        if use_pos_emb:
+            self.pos_embedding = nn.Parameter(
+                torch.randn(1, num_frames, input_dim) * 0.02
+            )
+        else:
+            self.pos_embedding = None
+        self.dropout = nn.Dropout(emb_dropout)
+        self.transformer = Transformer(
+            input_dim,
+            hidden_dim,
+            hidden_dim,
+            depth,
+            heads,
+            dim_head,
+            mlp_dim,
+            dropout,
+            block_class=Block,
+        )
+        self.out_proj = nn.Linear(hidden_dim, output_dim or input_dim)
+
+    def forward(self, x):
+        """
+        x: (B, T, input_dim)
+        returns: (B, T, output_dim)
+        """
+        T = x.size(1)
+        if self.pos_embedding is not None:
+            if T > self.num_frames:
+                raise ValueError(
+                    f"Sequence length {T} exceeds belief_encoder.num_frames={self.num_frames}"
+                )
+            x = x + self.pos_embedding[:, :T]
+        x = self.dropout(x)
+        x = self.transformer(x)
+        x = self.out_proj(x)
+        return x
+
+
+class ConditionalMLPBlock(nn.Module):
+    """Residual MLP block with AdaLN-zero conditioning (strictly pointwise in time)."""
+
+    def __init__(self, dim, mlp_dim, dropout=0.0):
+        super().__init__()
+        self.norm = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, mlp_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(mlp_dim, dim),
+            nn.Dropout(dropout),
+        )
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(), nn.Linear(dim, 3 * dim, bias=True)
+        )
+        nn.init.constant_(self.adaLN_modulation[-1].weight, 0)
+        nn.init.constant_(self.adaLN_modulation[-1].bias, 0)
+
+    def forward(self, x, c):
+        shift, scale, gate = self.adaLN_modulation(c).chunk(3, dim=-1)
+        x = x + gate * self.mlp(modulate(self.norm(x), shift, scale))
+        return x
+
+
+class BeliefPredictor(nn.Module):
+    """Single-step action-conditioned predictor mapping (b_t, a_t) -> b_{t+1}."""
+
+    def __init__(
+        self,
+        *,
+        depth,
+        mlp_dim,
+        input_dim,
+        hidden_dim,
+        output_dim=None,
+        cond_dim=None,
+        dropout=0.0,
+    ):
+        super().__init__()
+        output_dim = output_dim or input_dim
+        cond_dim = cond_dim or input_dim
+
+        self.input_proj = (
+            nn.Linear(input_dim, hidden_dim)
+            if input_dim != hidden_dim
+            else nn.Identity()
+        )
+        self.cond_proj = (
+            nn.Linear(cond_dim, hidden_dim)
+            if cond_dim != hidden_dim
+            else nn.Identity()
+        )
+        self.layers = nn.ModuleList(
+            [ConditionalMLPBlock(hidden_dim, mlp_dim, dropout) for _ in range(depth)]
+        )
+        self.norm = nn.LayerNorm(hidden_dim)
+        self.output_proj = nn.Linear(hidden_dim, output_dim)
+
+    def forward(self, x, c):
+        """
+        x: (B, T, input_dim)  - belief states b_t
+        c: (B, T, cond_dim)   - action embeddings a_t
+        returns: (B, T, output_dim)
+        """
+        x = self.input_proj(x)
+        c = self.cond_proj(c)
+        for block in self.layers:
+            x = block(x, c)
+        x = self.norm(x)
+        x = self.output_proj(x)
+        return x

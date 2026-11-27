@@ -34,6 +34,7 @@ optimizer:
   weight_decay: 1e-3
 
 num_preds: 1
+rollout_steps: null # null = unroll each belief to predict all future beliefs ahead of it
 
 loss:
   sigreg:
@@ -41,3 +42,6 @@ loss:
     kwargs:
       knots: 17
       num_proj: 1024
+  frame_sigreg:
+    enabled: false
+    weight: 0.09
