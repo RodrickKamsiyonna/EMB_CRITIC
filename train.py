@@ -207,6 +207,10 @@ def run(cfg):
     dataset_cfg = OmegaConf.to_container(cfg.data.dataset, resolve=True)
     dataset_name = dataset_cfg.pop("name")
     cache_dir = os.environ.get("LOCAL_DATASET_DIR", None)
+    if cache_dir is not None and not Path(dataset_name).is_absolute():
+        direct_path = Path(cache_dir) / dataset_name
+        if direct_path.exists():
+            dataset_name = str(direct_path)
     dataset = swm.data.load_dataset(
         dataset_name, transform=None, cache_dir=cache_dir, **dataset_cfg
     )
