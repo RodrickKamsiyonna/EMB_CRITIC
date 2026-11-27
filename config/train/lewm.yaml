@@ -5,7 +5,11 @@ defaults:
   - model: lewm
 
 output_model_name: lewm
-subdir: ${hydra:job.id}
+subdir: ${output_model_name}   # deterministic run dir for automatic resume
+
+training:
+  auto_resume: true            # automatically resume from run_dir/last.ckpt if present
+  save_every_n_steps: 500      # save only the latest checkpoint every 500 steps (not per epoch)
 
 num_workers: 6
 train_split: 0.9
